@@ -87,6 +87,7 @@ from awx.main.utils.common import (
 from awx.conf.license import get_license
 from awx.main.utils.handlers import SpecialInventoryHandler
 from awx.main.utils.update_model import NotOwner, update_model
+from awx.main.utils.failpoints import failpoint
 
 # Django flags
 from flags.state import flag_enabled
@@ -665,6 +666,7 @@ class BaseTask(object):
             # _required_status='running' skips it if something that took no ownership, such as a
             # reap, already ended the job; self.instance is then None, and run() stops without a
             # second terminal notification.
+            failpoint('job.before_finalize', job_id=pk, status=status)
             self.instance = _finalize_job_run(self.model, pk, self.runner_callback, status, owner_task_id=owner_task_id, _required_status='running')
         except NotOwner as exc:
             logger.warning(f'{self.instance.log_format} was taken over by task {exc.current_task_id}; not writing status {status} or releasing its work unit')
@@ -673,6 +675,7 @@ class BaseTask(object):
             # Guarantee work unit release even if finalization throws
             if release_work and receptor_job and getattr(receptor_job, 'work', None):
                 try:
+                    failpoint('job.after_finalize_before_release', job_id=pk, status=status)
                     receptor_job._receptor_release_work(receptor_job.work, status)
                 except Exception:
                     logger.exception(f'Failed to release work unit {getattr(receptor_job, "unit_id", "unknown")}')

@@ -104,6 +104,7 @@ from awx.main.tasks.receptor import (
 )
 from awx.main.tasks.signals import with_signal_handling
 from awx.main.utils.common import ignore_inventory_computed_fields, ignore_inventory_group_removal
+from awx.main.utils.failpoints import failpoint
 from awx.main.utils.migration import is_database_synchronized
 from awx.main.utils.reload import stop_local_services
 
@@ -710,6 +711,7 @@ def run_heartbeat(binder, clock=None):
 
     # Run common instance management logic — ctl is the same receptor connection used for
     # mesh status; we reuse it for the job processing loop to avoid a second socket open.
+    failpoint('heartbeat.start', periodic=binder is not None)
     this_inst, instance_list, lost_instances, _ctl = _heartbeat_instance_management(clock)
     if this_inst is None:
         return  # Early return case from instance management

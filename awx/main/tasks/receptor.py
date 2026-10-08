@@ -33,6 +33,7 @@ from dispatcherd.publish import task
 
 # AWX
 from awx.main.utils.execution_environments import get_default_pod_spec
+from awx.main.utils.failpoints import failpoint
 from awx.main.exceptions import ReceptorNodeNotFound
 from awx.main.utils.common import (
     deepmerge,
@@ -681,6 +682,7 @@ class AWXReceptorJob:
             # work_unit_id_assigned event then this case may have occured.
             self.task.instance.work_unit_id = result['unitid']  # Set work_unit_id in-memory only
             self.task.instance.log_lifecycle("work_unit_id_received")
+            failpoint('job.after_submit_before_unit_saved', job_id=self.task.instance.pk, unit_id=result['unitid'])
             self.task.update_model(self.task.instance.pk, work_unit_id=result['unitid'])
             self.task.instance.log_lifecycle("work_unit_id_assigned")
 
@@ -791,6 +793,7 @@ class AWXReceptorJob:
             logger.exception(f'Failed to get work results for unit {self.unit_id}')
             raise
 
+        failpoint('job.stream_started', job_id=self.task.instance.pk, unit_id=self.unit_id)
         reader = _CountingReader(resultfile)
 
         connections.close_all()
@@ -1617,6 +1620,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
     unit_id = job.work_unit_id
 
     try:
+        failpoint('adoption.unit_status', job_id=job.id, unit_id=unit_id)
         if unit_status is None:
             unit_status = get_adoption_unit_status(work, job)
         state_name = unit_status.get('StateName', '')
@@ -1649,6 +1653,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
     # event back until the job ended, and for a remotely adopted unit that is the one window
     # where receptor can lose the final stdout flush.
     safe_threshold, collision_zone, persisted_ct = _compute_adoption_dedup(job)
+    failpoint('adoption.after_snapshot', job_id=job.id, safe_threshold=safe_threshold, persisted=len(collision_zone))
     max_counter = max(collision_zone) if collision_zone else safe_threshold
     logger.info(
         f'Job {job.id}: safe_threshold={safe_threshold} collision_zone_size={len(collision_zone)} '
@@ -1720,6 +1725,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
     finalized = None
     release_work = True
     try:
+        failpoint('adoption.before_finalize', job_id=job.id)
         finalized = _finalize_adoption_result(
             job, callback, res, process_phase_failed, work, unit_id, private_data_dir, pod_name=pod_name, clock=clock, owner_task_id=owner_task_id
         )
@@ -1733,6 +1739,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
         # - finalized=True: adoption succeeded, release unit
         # - finalized=False: adoption deferred (unit still running), don't release
         # - finalized=None: already handled (e.g., quota exceeded), release unit
+        failpoint('adoption.after_finalize_before_release', job_id=job.id, finalized=finalized)
         if release_work and finalized is not False:
             receptor_job._receptor_release_work(work, getattr(res, 'status', 'error'))
         shutil.rmtree(private_data_dir, ignore_errors=True)
