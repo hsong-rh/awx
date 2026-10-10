@@ -167,3 +167,36 @@ def test_record_snapshot_never_raises(settings):
     settings.AWX_FAILPOINTS_ENABLED = True
     with mock.patch.object(failpoints, 'ensure_tables', side_effect=RuntimeError('db down')):
         failpoints.record_snapshot('host_map', 1, {'h1': 1})
+
+
+class _FlakyCursor:
+    """Fails the first pause poll as if the database restarted, then reports a release."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params):
+        self.calls += 1
+        if self.calls == 1:
+            raise failpoints.DatabaseError('server closed the connection unexpectedly')
+
+    def fetchone(self):
+        return (True,)
+
+
+def test_pause_survives_a_database_restart():
+    cursor = _FlakyCursor()
+    with (
+        mock.patch.object(failpoints.connection, 'cursor', return_value=cursor),
+        mock.patch.object(failpoints.connection, 'close') as close,
+        mock.patch.object(failpoints.time, 'sleep'),
+    ):
+        failpoints._pause('adoption.before_finalize', {'timeout': 60})
+    assert close.call_count == 1
+    assert cursor.calls == 2
