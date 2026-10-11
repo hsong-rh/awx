@@ -48,6 +48,7 @@ logger = logging.getLogger('awx.main.utils.failpoints')
 # devel has same-controller adoption only (PR #16636): there is no cross-controller claim,
 # orphan sweep or shutdown announcement, so those failpoints do not exist on this branch.
 REGISTRY = {
+    'mesh.ignore_advertisement': 'inspect_execution_and_hop_nodes: a mesh advertisement from an execution or hop node (ctx: advertised). A fired hit skips it, so the node looks unseen.',
     'heartbeat.start': 'Start of cluster_node_heartbeat, before instance management. Pausing it makes this node miss heartbeats while staying alive.',
     'job.after_submit_before_unit_saved': 'Normal job path: work unit submitted to receptor, work_unit_id not yet saved on the job.',
     'job.stream_started': 'Normal job and adoption path: results stream opened, before the first event is read.',
