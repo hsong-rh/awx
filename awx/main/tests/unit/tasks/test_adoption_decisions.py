@@ -117,9 +117,35 @@ class TestGateLostInstances:
 
 
 class TestLostInstanceDecisions:
-    @pytest.mark.parametrize('work_unit_id', ['unit-1', ''])
-    def test_jobs_of_a_lost_instance_are_reaped(self, work_unit_id):
-        assert lost_instance_job_action(make_job(controller_node=PEER, work_unit_id=work_unit_id)) == JobAction.REAP
+    def decide(self, job, slot_available=True):
+        return lost_instance_job_action(job, PEER, lambda: slot_available)
+
+    def test_dispatched_job_of_a_lost_controller_is_adopted(self):
+        assert self.decide(make_job(controller_node=PEER)) == JobAction.ADOPT
+
+    def test_adoptable_job_is_deferred_when_this_controller_has_no_room(self):
+        # It stays owned by the lost controller, so another controller's orphan sweep finds it.
+        assert self.decide(make_job(controller_node=PEER), slot_available=False) == JobAction.DEFER
+
+    def test_job_that_never_reached_an_execution_environment_goes_back_to_pending(self):
+        assert self.decide(make_job(controller_node=PEER, work_unit_id='', started=None)) == JobAction.REQUEUE
+
+    @pytest.mark.parametrize(
+        'job_fields',
+        [
+            {'controller_node': PEER, 'work_unit_id': ''},  # started, but never dispatched to receptor
+            {'controller_node': PEER, 'execution_node': PEER},  # the lost node ran the playbook too
+            {'controller_node': ME, 'execution_node': PEER},  # only the execution node was lost
+        ],
+    )
+    def test_job_that_cannot_be_adopted_is_reaped(self, job_fields):
+        assert self.decide(make_job(**job_fields)) == JobAction.REAP
+
+    def test_capacity_is_asked_only_for_a_job_that_would_be_adopted(self):
+        def slot_available():
+            raise AssertionError('capacity was read for a job that is reaped anyway')
+
+        assert lost_instance_job_action(make_job(controller_node=PEER, work_unit_id=''), PEER, slot_available) == JobAction.REAP
 
     @pytest.mark.parametrize(
         'node_type, node_state, auto_deprovision, expected',

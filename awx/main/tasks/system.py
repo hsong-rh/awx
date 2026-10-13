@@ -78,6 +78,7 @@ from awx.main.tasks.adoption_decisions import (
     find_lost_instances,
     gate_lost_instances,
     lost_instance_disposition,
+    lost_instance_job_action,
     running_job_action,
     startup_job_action,
 )
@@ -899,31 +900,32 @@ def _heartbeat_check_versions(this_inst, instance_list):
 
 def _handle_lost_instance_job(j, other_inst):
     """Process a single job from a lost instance: adopt if possible, reap otherwise."""
-    adoptable = j.work_unit_id and j.controller_node == other_inst.hostname and j.execution_node != other_inst.hostname
-    if not adoptable:
-        if not j.started and not j.work_unit_id:
-            # Job never reached an EE — re-queue so any controller can dispatch it.
-            j.refresh_from_db(fields=['status'])
-            if j.status in ('running', 'waiting'):
-                UnifiedJob.objects.filter(pk=j.id, status=j.status).update(
-                    status='pending',
-                    controller_node='',
-                    execution_node='',
-                )
-                logger.info(f'Job {j.id} never started on lost controller {other_inst.hostname}; reset to pending for re-dispatch')
-                return
-        reaper.reap_job(j, 'failed', job_explanation='Job reaped due to instance shutdown')
+    # Capacity is checked before the claim with headroom for this job, which is not yet in
+    # consumed_capacity. Declining leaves the job running and still owned by the dead
+    # controller, the sweep's exact predicate, and the Instance row is deleted moments later
+    # by our caller, so a peer picks it up on its next heartbeat. Claim first and the job is
+    # ours for good: a claim sets controller_node to a live node, and the sweep never steals
+    # from a live node, which is how one pod used to end up with every job.
+    action = lost_instance_job_action(j, other_inst.hostname, lambda: _adoption_slot_available(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT))
+
+    if action == JobAction.DEFER:
+        logger.info(f'Cross-controller adoption deferred for job {j.id}: no control capacity here, leaving it for another controller to sweep')
         return
 
-    # Take only what we can hold. This loop used to claim every job of the lost controller
-    # unconditionally, which is how one pod ended up with all of them: a claim sets
-    # controller_node to a live node, and the orphan sweep will not steal from a live node, so
-    # nothing could redistribute them afterwards. Declining here leaves the job running and
-    # still owned by the dead controller — the sweep's exact predicate — and the Instance row
-    # is deleted moments later by our caller, so the peer picks it up on its next heartbeat.
-    # Checked before the claim for that reason: claim first and the job is ours for good.
-    if not _adoption_slot_available(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT):
-        logger.info(f'Cross-controller adoption deferred for job {j.id}: no control capacity here, leaving it for another controller to sweep')
+    if action == JobAction.REQUEUE:
+        # Job never reached an EE — re-queue so any controller can dispatch it.
+        j.refresh_from_db(fields=['status'])
+        if j.status in ('running', 'waiting'):
+            UnifiedJob.objects.filter(pk=j.id, status=j.status).update(
+                status='pending',
+                controller_node='',
+                execution_node='',
+            )
+            logger.info(f'Job {j.id} never started on lost controller {other_inst.hostname}; reset to pending for re-dispatch')
+            return
+
+    if action != JobAction.ADOPT:
+        reaper.reap_job(j, 'failed', job_explanation='Job reaped due to instance shutdown')
         return
 
     task_id = claim_for_adoption(j, new_controller=settings.CLUSTER_HOST_ID)
