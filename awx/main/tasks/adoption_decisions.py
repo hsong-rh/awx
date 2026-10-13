@@ -40,21 +40,40 @@ def find_lost_instances(instance_list, this_hostname, ref_time):
     return lost, remaining
 
 
-def live_controller_hostnames(instances, ref_time, grace_seconds):
-    """Hostnames of the instances the orphan sweep must not take jobs from.
+def live_controller_hostnames(instances, ref_time, grace_seconds, mesh_hostnames=()):
+    """Hostnames of the controllers the orphan sweep must not take jobs from.
 
-    An instance is live while it is ready or installed. It also stays live while unavailable
-    if it checked in within grace_seconds of ref_time: one failed Redis ping marks a running
-    controller unavailable with a recent last_seen, and sweeping its jobs then had the
-    controller and its peers all stream them (AAP-96708). A controller that leaves on purpose
-    back-dates its last_seen past the grace period, so its jobs are swept at once.
+    An instance is live while it is ready or installed, or draining (deprovisioning), which
+    still runs its jobs. It also stays live while unavailable if it checked in within
+    grace_seconds of ref_time: one failed Redis ping marks a running controller unavailable
+    with a recent last_seen, and sweeping its jobs then had the controller and its peers all
+    stream them (AAP-96708). A controller that leaves on purpose back-dates its last_seen past
+    the grace period, so its jobs are swept at once.
+
+    A controller with no row at all was deprovisioned, which says nothing about whether it is
+    still running. mesh_hostnames are the nodes on the receptor mesh; one of them without a row
+    is still live. A controller that has a row is judged by its row alone, so a departure it
+    announced is not held up while its connection lingers.
     """
     cutoff = ref_time - timedelta(seconds=grace_seconds)
-    return {
-        inst.hostname
-        for inst in instances
-        if inst.node_state in ('ready', 'installed') or (inst.node_state == 'unavailable' and inst.last_seen is not None and inst.last_seen >= cutoff)
-    }
+    live = set()
+    with_rows = set()
+    for inst in instances:
+        with_rows.add(inst.hostname)
+        if inst.node_state in ('ready', 'installed', 'deprovisioning') or (
+            inst.node_state == 'unavailable' and inst.last_seen is not None and inst.last_seen >= cutoff
+        ):
+            live.add(inst.hostname)
+    return live | (set(mesh_hostnames) - with_rows)
+
+
+def mesh_hostnames(mesh_status):
+    """The nodes receptor's routing table names, from its status: every node with a known route."""
+    costs = (mesh_status or {}).get('KnownConnectionCosts') or {}
+    names = set(costs)
+    for peers in costs.values():
+        names.update(peers or {})
+    return names
 
 
 def gate_lost_instances(lost_instances, mesh_ready):
@@ -133,6 +152,19 @@ def adoption_slot_available(capacity, remaining_capacity, headroom_needed=0):
     """
     if not capacity:
         return True
+    return remaining_capacity >= headroom_needed
+
+
+def room_for_another_controllers_job(enabled, capacity, remaining_capacity, headroom_needed=0):
+    """May this controller take a job from a controller that was lost?
+
+    Stricter than adoption_slot_available, which governs a controller's own jobs. A disabled
+    controller, or one with no capacity (draining or not yet sized), is not one the task
+    manager would place work on, so it takes no one else's either (4.3). Declining is safe:
+    the job stays owned by the lost controller, where another controller's sweep finds it.
+    """
+    if not enabled or not capacity:
+        return False
     return remaining_capacity >= headroom_needed
 
 

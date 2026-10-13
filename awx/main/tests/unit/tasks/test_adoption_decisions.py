@@ -11,6 +11,8 @@ from awx.main.tasks.adoption_decisions import (
     adoption_slot_available,
     find_lost_instances,
     live_controller_hostnames,
+    mesh_hostnames,
+    room_for_another_controllers_job,
     gate_lost_instances,
     lost_instance_disposition,
     lost_instance_job_action,
@@ -211,9 +213,54 @@ class TestLiveControllerHostnames:
     def test_unavailable_instance_never_seen_is_not_live(self):
         assert self.live(make_instance(PEER, node_state='unavailable', seconds_since_seen=None)) == set()
 
-    @pytest.mark.parametrize('node_state', ['provisioning', 'deprovisioning', 'provision-fail', 'deprovision-fail'])
+    def test_draining_instance_is_live(self):
+        # 4.8 A controller set to drain is still running its jobs.
+        assert self.live(make_instance(PEER, node_state='deprovisioning', seconds_since_seen=10_000)) == {PEER}
+
+    @pytest.mark.parametrize('node_state', ['provisioning', 'provision-fail', 'deprovision-fail'])
     def test_instance_in_any_other_state_is_not_live(self, node_state):
         assert self.live(make_instance(PEER, node_state=node_state)) == set()
+
+    def test_controller_without_a_row_is_live_while_it_is_on_the_mesh(self):
+        # 2.4 Deprovisioning a live controller deletes its row while it still streams its jobs.
+        assert live_controller_hostnames([], NOW, self.GRACE, mesh_hostnames={PEER}) == {PEER}
+
+    def test_controller_without_a_row_and_off_the_mesh_is_not_live(self):
+        assert PEER not in live_controller_hostnames([], NOW, self.GRACE, mesh_hostnames={EXEC})
+
+    def test_departed_controller_is_not_live_while_its_connection_lingers(self):
+        # A controller that announced its shutdown keeps its row, unavailable and back-dated;
+        # its jobs are swept at once even though its receptor has not dropped off the mesh yet.
+        departed = make_instance(PEER, node_state='unavailable', seconds_since_seen=self.GRACE + 1)
+        assert live_controller_hostnames([departed], NOW, self.GRACE, mesh_hostnames={PEER}) == set()
+
+
+class TestMeshHostnames:
+    def test_every_node_named_in_the_routing_table_is_on_the_mesh(self):
+        status = {'KnownConnectionCosts': {ME: {PEER: 1, EXEC: 1}, PEER: {ME: 1}}}
+        assert mesh_hostnames(status) == {ME, PEER, EXEC}
+
+    @pytest.mark.parametrize('status', [{}, {'KnownConnectionCosts': None}, {'KnownConnectionCosts': {}}])
+    def test_empty_routing_table_puts_no_one_on_the_mesh(self, status):
+        assert mesh_hostnames(status) == set()
+
+
+class TestRoomForAnotherControllersJob:
+    IMPACT = 1
+
+    def test_enabled_node_with_room_takes_the_job(self):
+        assert room_for_another_controllers_job(enabled=True, capacity=10, remaining_capacity=3, headroom_needed=self.IMPACT) is True
+
+    def test_node_without_headroom_for_the_job_declines(self):
+        assert room_for_another_controllers_job(enabled=True, capacity=10, remaining_capacity=0, headroom_needed=self.IMPACT) is False
+
+    def test_disabled_node_declines(self):
+        # 4.3 The task manager would not place work on it, so it takes no one else's either.
+        assert room_for_another_controllers_job(enabled=False, capacity=10, remaining_capacity=10, headroom_needed=self.IMPACT) is False
+
+    def test_node_without_capacity_declines(self):
+        # Zero capacity means draining or unsized: room for its own jobs, none for another's.
+        assert room_for_another_controllers_job(enabled=True, capacity=0, remaining_capacity=0) is False
 
 
 class TestStartupJobAction:

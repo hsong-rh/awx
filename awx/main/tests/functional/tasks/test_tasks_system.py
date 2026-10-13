@@ -28,6 +28,7 @@ from awx.main.tasks.system import (
     _handle_lost_instance_job,
     _dispatch_adoption,
     _adoption_slot_available,
+    _room_for_another_controllers_job,
     cluster_node_heartbeat,
     _startup_reap_undispatched,
     _startup_sweep_orphaned_jobs,
@@ -417,6 +418,12 @@ class TestHeartbeatHandleLostInstancesLock:
 
 @pytest.mark.django_db
 class TestReapAndMarkLostInstance:
+    @pytest.fixture(autouse=True)
+    def room_here(self):
+        """This controller may take the lost controller's jobs; capacity is TestLostInstanceCapacity's subject."""
+        with patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=True):
+            yield
+
     def _inst(self, **kwargs):
         defaults = {'hostname': 'ctrl-1', 'node_type': 'control', 'node_state': 'ready'}
         defaults.update(kwargs)
@@ -1537,6 +1544,15 @@ class TestOrphanSweep:
     a live instance, which removes the job from every other node's sweep.
     """
 
+    @pytest.fixture(autouse=True)
+    def dead_controllers_are_off_the_mesh_and_this_one_has_room(self):
+        with (
+            patch('awx.main.tasks.system._receptor_mesh_hostnames', return_value=set()) as mesh,
+            patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=True),
+        ):
+            self.mesh = mesh
+            yield
+
     def _orphan(self, controller_node='dead-controller', work_unit_id='unit-orphan', **kwargs):
         kwargs.setdefault('status', 'running')
         kwargs.setdefault('started', now() - timedelta(seconds=600))
@@ -1670,7 +1686,7 @@ class TestOrphanSweep:
         jobs = [self._orphan(work_unit_id=f'unit-{i}') for i in range(4)]
 
         with (
-            patch('awx.main.tasks.system._adoption_slot_available', side_effect=[True, True, False, False]),
+            patch('awx.main.tasks.system._room_for_another_controllers_job', side_effect=[True, True, False, False]),
             patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _sweep_orphaned_jobs(me_inst)
@@ -1688,7 +1704,7 @@ class TestOrphanSweep:
         oldest = self._orphan(work_unit_id='unit-old', started=now() - timedelta(seconds=9000))
 
         with (
-            patch('awx.main.tasks.system._adoption_slot_available', side_effect=[True, False]),
+            patch('awx.main.tasks.system._room_for_another_controllers_job', side_effect=[True, False]),
             patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _sweep_orphaned_jobs(me_inst)
@@ -1708,7 +1724,7 @@ class TestOrphanSweep:
 
         with (
             patch('awx.main.tasks.system._publish_adoption') as queue,
-            patch('awx.main.tasks.system._adoption_slot_available', side_effect=peer_wins_the_claim),
+            patch('awx.main.tasks.system._room_for_another_controllers_job', side_effect=peer_wins_the_claim),
         ):
             _sweep_orphaned_jobs(me_inst)
 
@@ -1780,6 +1796,64 @@ class TestOrphanSweep:
 
         assert calls == ['process', 'sweep']
 
+    def test_controller_without_a_row_still_on_the_mesh_keeps_its_job(self, me_inst):
+        """2.4 Deprovisioning a live controller deletes its row while it still streams its job."""
+        job = self._orphan(controller_node='deprovisioned-but-alive')
+        self.mesh.return_value = {'deprovisioned-but-alive', me_inst.hostname}
+
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
+            _sweep_orphaned_jobs(me_inst)
+
+        queue.assert_not_called()
+        assert Job.objects.get(pk=job.pk).controller_node == 'deprovisioned-but-alive'
+
+    def test_unreadable_mesh_leaves_a_controller_without_a_row_for_later(self, me_inst):
+        job = self._orphan()
+        self.mesh.return_value = None
+
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
+            _sweep_orphaned_jobs(me_inst)
+
+        queue.assert_not_called()
+        assert Job.objects.get(pk=job.pk).controller_node == 'dead-controller'
+
+    def test_mesh_is_not_read_when_every_controller_has_a_row(self, me_inst):
+        Instance.objects.create(hostname='offline-node', node_type='control', node_state=Instance.States.UNAVAILABLE)
+        self._orphan(controller_node='offline-node')
+
+        with patch('awx.main.tasks.system._publish_adoption'):
+            _sweep_orphaned_jobs(me_inst)
+
+        self.mesh.assert_not_called()
+
+    def test_draining_controller_keeps_its_job(self, me_inst):
+        """4.8 A controller set to drain still runs its jobs."""
+        Instance.objects.create(hostname='draining-node', node_type='control', node_state=Instance.States.DEPROVISIONING)
+        job = self._orphan(controller_node='draining-node')
+
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
+            _sweep_orphaned_jobs(me_inst)
+
+        queue.assert_not_called()
+        assert Job.objects.get(pk=job.pk).controller_node == 'draining-node'
+
+    @pytest.mark.parametrize('enabled, capacity', [(False, 100), (True, 0)], ids=['disabled', 'no-capacity'])
+    def test_node_the_task_manager_would_not_use_sweeps_nothing(self, me_inst, enabled, capacity):
+        """4.3 A disabled or unsized node takes no lost controller's job."""
+        Instance.objects.filter(pk=me_inst.pk).update(enabled=enabled, capacity=capacity)
+        me_inst.refresh_from_db()
+        job = self._orphan()
+
+        with (
+            patch('awx.main.tasks.system._room_for_another_controllers_job', side_effect=_room_for_another_controllers_job),
+            patch.object(Instance.objects, 'me', return_value=me_inst),
+            patch('awx.main.tasks.system._publish_adoption') as queue,
+        ):
+            _sweep_orphaned_jobs(me_inst)
+
+        queue.assert_not_called()
+        assert Job.objects.get(pk=job.pk).controller_node == 'dead-controller'
+
 
 @pytest.mark.django_db
 class TestLostInstanceCapacity:
@@ -1813,7 +1887,7 @@ class TestLostInstanceCapacity:
         job = self._job(lost)
 
         with (
-            patch('awx.main.tasks.system._adoption_slot_available', return_value=False),
+            patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=False),
             patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _handle_lost_instance_job(job, lost)
@@ -1836,7 +1910,7 @@ class TestLostInstanceCapacity:
             return False
 
         with (
-            patch('awx.main.tasks.system._adoption_slot_available', side_effect=record),
+            patch('awx.main.tasks.system._room_for_another_controllers_job', side_effect=record),
             patch('awx.main.tasks.system._publish_adoption'),
         ):
             _handle_lost_instance_job(job, lost)
@@ -1852,7 +1926,7 @@ class TestLostInstanceCapacity:
         job = self._job(lost, work_unit_id='')
 
         with (
-            patch('awx.main.tasks.system._adoption_slot_available', return_value=False),
+            patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=False),
             patch('awx.main.tasks.system.reaper.reap_job') as reap_job,
         ):
             _handle_lost_instance_job(job, lost)
@@ -1865,7 +1939,7 @@ class TestLostInstanceCapacity:
         job = self._job(lost)
 
         with (
-            patch('awx.main.tasks.system._adoption_slot_available', return_value=True),
+            patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=True),
             patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _handle_lost_instance_job(job, lost)
@@ -1875,15 +1949,14 @@ class TestLostInstanceCapacity:
         queue.assert_called_once_with(job.id, Job.objects.get(pk=job.pk).celery_task_id)
 
     def test_headroom_is_requested_for_a_job_not_yet_claimed(self, me_inst, settings):
-        """_adoption_slot_available answers the post-claim question by default ("does the job I
-        already own fit?"). Here the job is not ours yet, so a full impact-unit of headroom has
-        to be asked for, or a controller at exactly capacity takes one job too many."""
+        """The job is not ours yet, so a full impact-unit of headroom has to be asked for, or a
+        controller at exactly capacity takes one job too many."""
         settings.CLUSTER_HOST_ID = me_inst.hostname
         lost = self._lost()
         job = self._job(lost)
 
         with (
-            patch('awx.main.tasks.system._adoption_slot_available', return_value=True) as slot,
+            patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=True) as slot,
             patch('awx.main.tasks.system._publish_adoption'),
         ):
             _handle_lost_instance_job(job, lost)
@@ -2186,7 +2259,7 @@ class TestStartupOrphanSweep:
         startup_sweep.assert_called_once()
 
     def test_it_sweeps_after_the_heartbeat_so_capacity_is_known(self, me_inst):
-        """`_sweep_orphaned_jobs` stops at `_adoption_slot_available()`, which reads this
+        """`_sweep_orphaned_jobs` stops at `_room_for_another_controllers_job()`, which reads this
         node's capacity. `cluster_node_heartbeat(None)` is what runs `local_health_check()` to
         set it, so sweeping first would adopt nothing."""
         calls = []
