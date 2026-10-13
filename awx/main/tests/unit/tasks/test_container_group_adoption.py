@@ -782,3 +782,14 @@ def test_attach_streams_on_the_adoption_clock(attach_env):
     attach_to_streaming_pod(_job(), 'automation-job-42-abcde', _pod(), receptor_ctl=ctl, clock=clock)
 
     assert attach_env['reattach_to_work_unit'].call_args.kwargs['clock'] is clock
+
+
+def test_harvest_unpacks_artifacts_where_the_post_run_hooks_read_them(harvest_env):
+    """The fact cache and inventory import read artifacts/<job id>; the pod log's artifacts
+    are relative to that directory, so the Processor has to be told the job's id."""
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+
+    with patch('awx.main.tasks.container_groups.ansible_runner.interface.run') as run:
+        harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
+
+    assert run.call_args.kwargs['ident'] == 42

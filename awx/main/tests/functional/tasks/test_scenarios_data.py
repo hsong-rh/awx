@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from awx.main.models import ActivityStream, Job
+from awx.main.models import ActivityStream, InventorySource, InventoryUpdate, Job
 from awx.main.tasks.system import adopt_job, awx_receptor_workunit_reaper
 from awx.main.tests.adoption_cluster import EXEC, PEER, UNIT, adoption_env, configure, make_cluster, mesh, run_lost_instance_handling
 from awx.main.tests.fake_receptor import FakeReceptorWork, FakeWorkUnit, RecordingDispatcher, make_events
@@ -139,3 +139,47 @@ def test_resumed_job_removes_its_original_private_data_dir(me_inst, settings):
     job.refresh_from_db()
     assert job.status == 'successful'
     assert not os.path.exists(original), f'{original} is still on disk'
+
+
+# ── What a job's playbook leaves in its artifacts ─────────────────────────────
+
+
+@pytest.mark.django_db
+def test_adopted_job_saves_the_facts_its_playbook_gathered(me_inst, inventory):
+    # 5.4 Fact caching. The playbook gathered facts after the controller restarted; they
+    # come back in the unit's artifacts, and the adopter saves them on the hosts as a
+    # normal run would.
+    host = inventory.hosts.create(name='fc-h1')
+    job = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id=UNIT, inventory=inventory, use_fact_cache=True)
+    facts = {'ansible_distribution': 'RedHat'}
+    artifacts = {
+        # Written before the playbook ran, so older than the facts it then gathered.
+        'host_cache_summary.json': (json.dumps({'last_write_time': 0, 'hosts_cached': {host.name: False}}), 60),
+        f'fact_cache/{host.name}': json.dumps(facts),
+    }
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10), artifacts=artifacts)})
+
+    adopt_job(job.id, open_work=lambda: work)
+
+    job.refresh_from_db()
+    host.refresh_from_db()
+    assert job.status == 'successful'
+    assert host.ansible_facts == facts
+
+
+@pytest.mark.django_db
+def test_adopted_inventory_update_imports_what_it_discovered(me_inst, inventory):
+    # 5.4 Other job types. An inventory update's result is the inventory it discovered,
+    # left in its artifacts as output.json; the adopter imports it as a normal run would.
+    source = InventorySource.objects.create(name='src', inventory=inventory, source='ec2')
+    update = InventoryUpdate.objects.create(
+        inventory_source=source, inventory=inventory, source='ec2', controller_node=me_inst.hostname, status='running', work_unit_id=UNIT
+    )
+    discovered = {'all': {'hosts': ['iu-h1']}, '_meta': {'hostvars': {'iu-h1': {}}}}
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(3), artifacts={'output.json': json.dumps(discovered)})})
+
+    adopt_job(update.id, open_work=lambda: work)
+
+    update.refresh_from_db()
+    assert update.status == 'successful', update.job_explanation
+    assert inventory.hosts.filter(name='iu-h1').exists()

@@ -350,6 +350,7 @@ def _process_pod_log(job, pod_name, callback, private_data_dir, follow):
             status_handler=callback.status_handler,
             artifacts_handler=callback.artifacts_handler,
             private_data_dir=private_data_dir,
+            ident=job.id,  # artifacts land in artifacts/<job id>, where the post-run hooks read them
         )
     finally:
         try:
