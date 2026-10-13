@@ -14,7 +14,7 @@ from awx.main.models import Job, JobEvent
 from awx.main.tasks import jobs
 from awx.main.tasks.receptor import AWXReceptorJob
 from awx.main.tasks.system import adopt_job
-from awx.main.tests.adoption_cluster import UNIT, adoption_env, save_dispatched_events
+from awx.main.tests.adoption_cluster import EXEC, PEER, THIS, UNIT, adoption_env, configure, heartbeat, make_cluster, mesh, save_dispatched_events
 from awx.main.tests.fake_clock import FakeClock
 from awx.main.tests.fake_receptor import FakeReceptorWork, FakeWorkUnit, RecordingDispatcher, make_events
 
@@ -135,3 +135,26 @@ def test_large_replay_sends_every_event_once(orphan):
     orphan.refresh_from_db()
     assert orphan.status == 'successful'
     assert RecordingDispatcher.counters() == list(range(501, 20001))
+
+
+@pytest.mark.django_db
+def test_claimed_job_whose_adoption_never_ran_is_queued_again(settings):
+    # 3.2 Claim committed, adoption never queued. ctrl-0 claims a lost controller's job and
+    # publishes its adoption, but the adoption never runs: the message was lost, or ctrl-0's
+    # dispatcher restarted first. The claim made the job ctrl-0's, so its next heartbeat
+    # finds it orphaned and queues the adoption again, under a newer claim.
+    configure(settings)
+    make_cluster()
+    job = Job.objects.create(
+        controller_node=PEER, execution_node=EXEC, status='running', work_unit_id=UNIT, celery_task_id='peer-task', started=now() - timedelta(seconds=60)
+    )
+
+    assert job.id in heartbeat(THIS, mesh(EXEC))
+    job.refresh_from_db()
+    first_claim = job.celery_task_id
+    assert job.controller_node == THIS
+
+    assert job.id in heartbeat(THIS, mesh(EXEC))
+    job.refresh_from_db()
+    assert job.celery_task_id != first_claim, 'the earlier adoption, if it ever runs, finds it no longer owns the job'
+    assert job.status == 'running'

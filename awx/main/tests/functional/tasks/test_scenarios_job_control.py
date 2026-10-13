@@ -118,6 +118,26 @@ def test_canceled_slice_of_a_lost_controller_ends_canceled_and_stops():
     assert ('cancel', UNIT) in work.calls
 
 
+@pytest.mark.django_db
+def test_canceled_workflow_cancels_its_orphaned_node():
+    # 4.13 Canceling a workflow with an orphaned node. The workflow was canceled while
+    # ctrl-1, which controls one of its node jobs, was down; the cancel set the node job's
+    # cancel_flag but its signal reached no one. On devel the job is marked failed and its
+    # playbook runs on. The controller that adopts it cancels the unit and ends it canceled.
+    make_cluster()
+    workflow = WorkflowJob.objects.create(name='outer', status='running', cancel_flag=True)
+    job = peer_job(cancel_flag=True)
+    WorkflowJobNode.objects.create(workflow_job=workflow, job=job)
+    work = running_unit()
+
+    run_lost_instance_handling(mesh(EXEC), work=work)
+    adopt_claimed([job], work)
+
+    job.refresh_from_db()
+    assert job.status == 'canceled'
+    assert ('cancel', UNIT) in work.calls
+
+
 # ── A reaped job whose playbook keeps running ─────────────────────────────────
 
 
