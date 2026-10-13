@@ -9,6 +9,7 @@ from awx.main.tasks.adoption_decisions import (
     JobAction,
     LostInstanceAction,
     adoption_deadline_passed,
+    adoption_slot_available,
     find_lost_instances,
     gate_lost_instances,
     lost_instance_disposition,
@@ -162,6 +163,30 @@ class TestLostInstanceDecisions:
     def test_disposition(self, node_type, node_state, auto_deprovision, expected):
         inst = make_instance(PEER, node_type=node_type, node_state=node_state)
         assert lost_instance_disposition(inst, auto_deprovision) == expected
+
+
+class TestAdoptionSlotAvailable:
+    IMPACT = 1  # AWX_CONTROL_NODE_TASK_IMPACT
+
+    def test_room_left_takes_the_job(self):
+        assert adoption_slot_available(capacity=10, remaining_capacity=3) is True
+
+    def test_job_that_exactly_fills_this_controller_is_taken(self):
+        # 4.3: after the claim the job is already counted, so zero remaining means it fits exactly.
+        assert adoption_slot_available(capacity=10, remaining_capacity=0) is True
+
+    def test_controller_over_capacity_defers(self):
+        # 4.16, 4.22: overcommitted after earlier adoptions, or scaled down mid-adoption.
+        assert adoption_slot_available(capacity=10, remaining_capacity=-1) is False
+
+    def test_asking_before_the_claim_needs_headroom_for_the_job(self):
+        # 4.9: the job is not counted yet, so a controller at exactly capacity has no room for it.
+        assert adoption_slot_available(capacity=10, remaining_capacity=0, headroom_needed=self.IMPACT) is False
+        assert adoption_slot_available(capacity=10, remaining_capacity=1, headroom_needed=self.IMPACT) is True
+
+    def test_unsized_or_draining_controller_does_not_block_adoption(self):
+        # Zero capacity means not yet sized by the capacity job, or draining. Neither is "no room".
+        assert adoption_slot_available(capacity=0, remaining_capacity=-5, headroom_needed=self.IMPACT) is True
 
 
 class TestStartupJobAction:

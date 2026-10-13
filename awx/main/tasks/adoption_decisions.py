@@ -83,6 +83,42 @@ def lost_instance_disposition(inst, auto_deprovision):
     return LostInstanceAction.NONE
 
 
+def adoption_slot_available(capacity, remaining_capacity, headroom_needed=0):
+    """Is there room on this controller for one more adoption?
+
+    An adoption is the one dispatcher task that occupies its worker for the whole remaining
+    runtime of a job, because it streams that job's events. A controller inheriting a large
+    instance's jobs would otherwise fill the pool with adoptions and starve the heartbeat,
+    at which point the rest of the cluster declares *this* controller lost too and the
+    cascade repeats. Jobs over the bound are simply not adopted this cycle: they stay running
+    and claimed by us, so the next heartbeat re-queues them.
+
+    Control capacity is that bound. It already prices exactly this cost — one
+    AWX_CONTROL_NODE_TASK_IMPACT per running job we are the controller_node for — and an
+    adopted job is controlled by us, so it is already in consumed_capacity. That makes the
+    two adoption shapes fall out correctly without a second knob: re-adopting our own jobs
+    after a restart is net zero, because those jobs counted against us before we died and
+    still do, while inheriting a dead peer's jobs is genuinely new load and is throttled
+    against the same number that bounds normally dispatched work. Operators tune it with the
+    capacity_adjustment slider they already use.
+
+    After a claim the job being considered is itself counted, so remaining_capacity == 0
+    means it is the one that exactly fills us. That is the default, headroom_needed=0.
+
+    Callers that ask *before* claiming pass headroom_needed=AWX_CONTROL_NODE_TASK_IMPACT,
+    because their job is not in consumed_capacity yet and a controller sitting at exactly
+    capacity would otherwise take one job too many. The lost-instance path is the one such
+    caller: it has to decline rather than claim, so that a job it cannot hold stays owned by
+    the dead controller and remains visible to another node's orphan sweep.
+
+    Zero capacity means draining or not yet sized by the capacity job, not "no room";
+    consumed_capacity is not meaningful against it, so it does not block adoption.
+    """
+    if not capacity:
+        return True
+    return remaining_capacity >= headroom_needed
+
+
 def startup_job_action(job):
     """At startup, a running job this controller owns is adopted if it was dispatched to receptor, else reaped."""
     if job.work_unit_id:

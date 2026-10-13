@@ -75,6 +75,7 @@ from awx.main.models.credential import CredentialType
 from awx.main.tasks.adoption_decisions import (
     JobAction,
     LostInstanceAction,
+    adoption_slot_available,
     find_lost_instances,
     gate_lost_instances,
     lost_instance_disposition,
@@ -1379,33 +1380,7 @@ def announce_shutdown():
 
 
 def _adoption_slot_available(headroom_needed=0):
-    """Is there room on this controller for one more adoption?
-
-    An adoption is the one dispatcher task that occupies its worker for the whole remaining
-    runtime of a job, because it streams that job's events. A controller inheriting a large
-    instance's jobs would otherwise fill the pool with adoptions and starve the heartbeat,
-    at which point the rest of the cluster declares *this* controller lost too and the
-    cascade repeats. Jobs over the bound are simply not adopted this cycle: they stay running
-    and claimed by us, so the next heartbeat re-queues them.
-
-    Control capacity is that bound. It already prices exactly this cost — one
-    AWX_CONTROL_NODE_TASK_IMPACT per running job we are the controller_node for — and an
-    adopted job is controlled by us, so it is already in consumed_capacity. That makes the
-    two adoption shapes fall out correctly without a second knob: re-adopting our own jobs
-    after a restart is net zero, because those jobs counted against us before we died and
-    still do, while inheriting a dead peer's jobs is genuinely new load and is throttled
-    against the same number that bounds normally dispatched work. Operators tune it with the
-    capacity_adjustment slider they already use.
-
-    The claim (claim_for_adoption) runs before this check, so the job being considered
-    is itself counted; remaining_capacity == 0 means it is the one that exactly fills us.
-    That is the default, headroom_needed=0.
-
-    Callers that ask *before* claiming pass headroom_needed=AWX_CONTROL_NODE_TASK_IMPACT,
-    because their job is not in consumed_capacity yet and a controller sitting at exactly
-    capacity would otherwise take one job too many. _handle_lost_instance_job is the one such
-    caller: it has to decline rather than claim, so that a job it cannot hold stays owned by
-    the dead controller and remains visible to another node's orphan sweep.
+    """Is there room on this controller for one more adoption? See adoption_slot_available.
 
     Fails open. A job nobody adopts has nothing left to finalize it, so an unreadable
     instance row is a worse reason to strand one than a full controller is.
@@ -1415,13 +1390,7 @@ def _adoption_slot_available(headroom_needed=0):
     except Exception:
         logger.warning('Could not read the control capacity of this instance; proceeding with this adoption', exc_info=True)
         return True
-
-    # Zero capacity means draining or not yet sized by the capacity job, not "no room" —
-    # consumed_capacity is not meaningful against it, so do not let it block adoption.
-    if not me.capacity:
-        return True
-
-    return me.remaining_capacity >= headroom_needed
+    return adoption_slot_available(me.capacity, me.remaining_capacity, headroom_needed=headroom_needed)
 
 
 @task(queue=get_task_queuename, on_duplicate='discard')
