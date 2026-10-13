@@ -480,6 +480,28 @@ def test_the_adoption_owner_reaches_both_recovery_paths(adoption_env):
     assert adoption_env['attach_to_streaming_pod'].call_args.kwargs['owner_task_id'] == 'adoption-task'
 
 
+def test_the_adoption_clock_reaches_triage_and_both_recovery_paths(adoption_env):
+    clock = Mock(return_value=NOW)
+    adoption_env['classify_job_pod'].return_value = PodState.TERMINAL
+    adopt_container_group_job(_job(), clock=clock)
+    assert adoption_env['classify_job_pod'].call_args.kwargs['reference_time'] == NOW
+    assert adoption_env['harvest_terminal_pod'].call_args.kwargs['clock'] is clock
+
+    adoption_env['classify_job_pod'].return_value = PodState.STREAMING
+    adopt_container_group_job(_job(), clock=clock)
+    assert adoption_env['attach_to_streaming_pod'].call_args.kwargs['clock'] is clock
+
+
+def test_the_absent_pod_budget_is_measured_on_the_adoption_clock(adoption_env):
+    clock = Mock(return_value=NOW)
+    adoption_env['find_job_pod'].return_value = None
+    adoption_env['classify_job_pod'].return_value = PodState.ABSENT
+
+    adopt_container_group_job(_job(), clock=clock)
+
+    assert adoption_env['budget_exhausted'].call_args.kwargs['clock'] is clock
+
+
 def test_output_probe_is_skipped_for_a_terminal_pod(adoption_env):
     """A finished pod is harvested regardless, so do not spend an API call asking."""
     adoption_env['find_job_pod'].return_value = _pod(phase='Succeeded', exit_code=0)
@@ -741,3 +763,22 @@ def test_harvest_by_a_task_that_lost_the_job_writes_nothing_and_is_done(harvest_
 
     assert harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0), owner_task_id='adoption-task') is True
     assert not tmp_path.exists(), 'private_data_dir leaked'
+
+
+def test_harvest_finalizes_on_the_adoption_clock(harvest_env):
+    clock = Mock(return_value=NOW)
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+
+    harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0), clock=clock)
+
+    assert harvest_env['_finalize_adopted_job'].call_args.kwargs['clock'] is clock
+
+
+def test_attach_streams_on_the_adoption_clock(attach_env):
+    clock = Mock(return_value=NOW)
+    ctl = _receptor_ctl()
+    ctl.simple_command.return_value = {'StateName': 'Running', 'ExtraData': {'PodName': 'automation-job-42-abcde'}}
+
+    attach_to_streaming_pod(_job(), 'automation-job-42-abcde', _pod(), receptor_ctl=ctl, clock=clock)
+
+    assert attach_env['reattach_to_work_unit'].call_args.kwargs['clock'] is clock

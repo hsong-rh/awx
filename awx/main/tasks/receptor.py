@@ -1431,7 +1431,7 @@ def clear_adoption_stall(job, reason):
         logger.warning(f'Could not clear adoption stall clock {reason} for job {job.id}: {exc}')
 
 
-def _adoption_stall_budget_exhausted(job, reason):
+def _adoption_stall_budget_exhausted(job, reason, clock=None):
     """Has adoption of this job been stalled on `reason` for longer than HADR_JOB_ADOPTION_TIMEOUT?
 
     Bounds how long an adoption that cannot make progress is retried. `reason` is one of
@@ -1442,13 +1442,16 @@ def _adoption_stall_budget_exhausted(job, reason):
     stall_budget_exhausted for the rule. The first-deferral time lives in this controller's cache. Losing it (cache restart,
     eviction, another controller adopting) only restarts the clock, which defers longer but
     never fails a job early. For the same reason, with no clock to read, the caller defers.
+
+    clock returns the current time and defaults to django.utils.timezone.now.
     """
     timeout = settings.HADR_JOB_ADOPTION_TIMEOUT
     key = _adoption_stall_key(job, reason)
     try:
         # add() is a no-op when the key exists, so the first deferral's time is kept.
         # The TTL only bounds leftovers; it outlives the timeout so the deadline is reached first.
-        cache.add(key, now(), timeout=timeout * 2 + 3600)
+        right_now = (clock or now)()
+        cache.add(key, right_now, timeout=timeout * 2 + 3600)
         stalled_since = cache.get(key)
     except Exception as exc:
         logger.warning(f'Could not read adoption stall clock {reason} for job {job.id}, deferring: {exc}')
@@ -1456,7 +1459,7 @@ def _adoption_stall_budget_exhausted(job, reason):
     if stalled_since is None:
         return False
     last_event_time = job.get_event_queryset().aggregate(Max('created'))['created__max']
-    return stall_budget_exhausted(stalled_since, last_event_time, now(), timeout)
+    return stall_budget_exhausted(stalled_since, last_event_time, right_now, timeout)
 
 
 def get_adoption_unit_status(work, job):
@@ -1658,7 +1661,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
         # stream the full event set rather than finalizing on a truncated one. Bounded
         # by HADR_JOB_ADOPTION_TIMEOUT from the first stall so a path that never recovers
         # still converges.
-        if not _adoption_stall_budget_exhausted(job, 'stall'):
+        if not _adoption_stall_budget_exhausted(job, 'stall', clock=clock):
             logger.info(f'Job {job.id}: results stream for unit {unit_id} stalled, deferring adoption for retry on next heartbeat')
             shutil.rmtree(private_data_dir, ignore_errors=True)
             return False

@@ -278,7 +278,7 @@ def requeue_wedged_job(job):
     return bool(updated)
 
 
-def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None):
+def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None, clock=None):
     """Recover a finished container-group job from its pod's log.
 
     The pod's stdout is the work unit's stdout, so this feeds the same ansible-runner process
@@ -323,7 +323,9 @@ def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None):
                 callback.delay_update(result_traceback=hook_error['traceback'])
 
         try:
-            _finalize_adopted_job(job, callback, exit_code, process_phase_failed=False, final_status=status, pod_name=pod_name, owner_task_id=owner_task_id)
+            _finalize_adopted_job(
+                job, callback, exit_code, process_phase_failed=False, final_status=status, pod_name=pod_name, clock=clock, owner_task_id=owner_task_id
+            )
         except NotOwner as exc:
             logger.warning(f'{job.log_format} was claimed by task {exc.current_task_id} while its pod was harvested; not finalizing it')
         return True
@@ -374,7 +376,7 @@ def _terminal_status(job, pod, res):
     return ('successful' if exit_code == 0 else 'failed'), exit_code
 
 
-def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id=None):
+def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id=None, clock=None):
     """Take over a container-group job whose pod is still running, by re-submitting it.
 
     The dead controller's work unit is unrecoverable, but the pod is not, and a new work unit
@@ -423,7 +425,9 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id
         UnifiedJob.objects.filter(pk=job.pk).update(work_unit_id=unit_id)
         job.work_unit_id = unit_id
 
-        return bool(reattach_to_work_unit(job, ReceptorWork(receptor_ctl), owner_task_id=owner_task_id, unit_status=unit_status, pod_name=pod_name))
+        return bool(
+            reattach_to_work_unit(job, ReceptorWork(receptor_ctl), clock=clock, owner_task_id=owner_task_id, unit_status=unit_status, pod_name=pod_name)
+        )
     finally:
         if close_ctl:
             try:
@@ -432,14 +436,15 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id
                 pass
 
 
-def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None):
+def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None, clock=None):
     """Recover a container-group job whose controller died, using its surviving pod.
 
     Called only once the receptor path has established that the work unit is unreachable,
     which for a container group means the submitting controller took it to the grave.
 
     owner_task_id is the adoption's claim. Harvesting and attaching both finalize the job, so
-    both are fenced by it.
+    both are fenced by it. clock returns the current time and defaults to
+    django.utils.timezone.now; the pod triage and the absent-pod budget are judged by it.
 
     Returns True if the job reached a terminal state (or was requeued) and needs no further
     attention, False if it should be re-triaged on the next heartbeat.
@@ -449,7 +454,7 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None):
         # A finished pod is harvested whatever the probe would say, so skip the API call.
         phase = (pod or {}).get('status', {}).get('phase')
         has_output = False if (pod is None or phase in TERMINAL_PHASES) else pod_has_output(job, pod['metadata']['name'])
-        state = classify_job_pod(pod, has_output=has_output)
+        state = classify_job_pod(pod, has_output=has_output, reference_time=(clock or now)())
     except Exception:
         # An unreachable Kubernetes API is a statement about this controller's connection,
         # not about the pod. Guessing here would delete live pods or fail live jobs.
@@ -460,7 +465,7 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None):
     logger.info(f'{job.log_format}: container-group pod triage = {state} (pod={pod_name})')
 
     if state == PodState.TERMINAL:
-        return harvest_terminal_pod(job, pod_name, pod, owner_task_id=owner_task_id)
+        return harvest_terminal_pod(job, pod_name, pod, owner_task_id=owner_task_id, clock=clock)
 
     if state == PodState.WEDGED:
         if not delete_job_pod(job, pod_name):
@@ -472,7 +477,7 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None):
         return True
 
     if state == PodState.ABSENT:
-        if not budget_exhausted(job, 'pod_absent'):
+        if not budget_exhausted(job, 'pod_absent', clock=clock):
             # The pod may simply not have been created yet when the controller died.
             logger.info(f'{job.log_format}: no container-group pod found yet, deferring adoption')
             return False
@@ -481,7 +486,7 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None):
         return True
 
     if state == PodState.STREAMING:
-        return attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=receptor_ctl, owner_task_id=owner_task_id)
+        return attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=receptor_ctl, owner_task_id=owner_task_id, clock=clock)
 
     # WAITING defers. The pod is silent and still inside the wedge budget, so a slow start and
     # a wedge are indistinguishable; the next triage tells them apart. It is deliberately not

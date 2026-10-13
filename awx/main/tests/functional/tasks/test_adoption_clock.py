@@ -7,10 +7,12 @@ controllers are checked exactly and in milliseconds.
 from unittest import mock
 
 import pytest
+from django.core.cache import cache
 from django.utils.timezone import now, timedelta
 
 from awx.main.models import Instance, Job, JobEvent
-from awx.main.tasks.system import _heartbeat_instance_management, adopt_job
+from awx.main.tasks import system
+from awx.main.tasks.system import _heartbeat_instance_management, _sweep_orphaned_jobs, adopt_job, run_heartbeat
 from awx.main.tests.fake_clock import FakeClock
 from awx.main.tests.fake_receptor import FakeReceptorWork, FakeWorkUnit, RecordingDispatcher, make_events
 
@@ -146,3 +148,106 @@ def test_orphan_past_the_deadline_is_failed_without_contacting_receptor(adoption
     assert job.status == 'failed'
     assert 'HADR_JOB_ADOPTION_TIMEOUT' in job.job_explanation
     opened.assert_not_called()
+
+
+# ── Stall budgets on the injected clock ──────────────────────────────────────
+
+
+@pytest.mark.django_db
+def test_unreachable_unit_is_failed_once_unreachable_past_the_budget(adoption_env, orphan):
+    # 3.9 on the clock: the budget starts at the first failed status query, not the last event.
+    cache.clear()
+    job, _ = orphan
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10), status_error=RuntimeError('no route to receptor-1'))})
+    clock = FakeClock()
+
+    adopt_job(job.id, open_work=lambda: work, clock=clock)
+    clock.advance(TIMEOUT)
+    adopt_job(job.id, open_work=lambda: work, clock=clock)
+    job.refresh_from_db()
+    assert job.status == 'running'
+
+    clock.advance(1)
+    adopt_job(job.id, open_work=lambda: work, clock=clock)
+    job.refresh_from_db()
+    assert job.status == 'failed'
+
+
+@pytest.mark.django_db
+def test_capacity_wait_is_measured_on_the_injected_clock(adoption_env, orphan):
+    cache.clear()
+    job, _ = orphan
+    opened = mock.Mock()
+    clock = FakeClock()
+
+    with mock.patch('awx.main.tasks.system._adoption_slot_available', return_value=False):
+        adopt_job(job.id, open_work=opened, clock=clock)
+        clock.advance(TIMEOUT + 1)
+        adopt_job(job.id, open_work=opened, clock=clock)
+
+    job.refresh_from_db()
+    assert job.status == 'failed'
+    opened.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_stalled_stream_is_finalized_once_stalled_past_the_budget(adoption_env, orphan):
+    # The stall watchdog itself runs on time.monotonic(); this drives what follows a stall.
+    cache.clear()
+    job, _ = orphan
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10))})
+    clock = FakeClock()
+
+    def stalled(receptor_job, _work):
+        receptor_job.stream_stalled = True
+        return None
+
+    with mock.patch('awx.main.tasks.receptor.AWXReceptorJob._process_phase', stalled):
+        adopt_job(job.id, open_work=lambda: work, clock=clock)
+        job.refresh_from_db()
+        assert job.status == 'running', 'a stalled stream defers'
+
+        clock.advance(TIMEOUT + 1)
+        adopt_job(job.id, open_work=lambda: work, clock=clock)
+
+    job.refresh_from_db()
+    assert job.status == 'successful', 'past the budget the unit status decides'
+
+
+# ── The orphan sweep on the injected clock ───────────────────────────────────
+
+
+@pytest.mark.django_db
+def test_sweep_takes_jobs_of_a_controller_unavailable_past_the_grace_period(heartbeat_settings, me_inst):
+    seen = now()
+    Instance.objects.create(hostname='ctrl-1', node_type='control', node_state='unavailable', last_seen=seen)
+    job = Job.objects.create(controller_node='ctrl-1', execution_node='receptor-1', status='running', work_unit_id=UNIT, started=seen)
+    clock = FakeClock(seen + timedelta(seconds=GRACE))
+
+    with (
+        mock.patch('awx.main.tasks.system._adoption_slot_available', return_value=True),
+        mock.patch('awx.main.tasks.system._publish_adoption') as publish,
+    ):
+        _sweep_orphaned_jobs(me_inst, clock=clock)
+        publish.assert_not_called()
+
+        clock.advance(1)
+        _sweep_orphaned_jobs(me_inst, clock=clock)
+
+    publish.assert_called_once()
+    job.refresh_from_db()
+    assert job.controller_node == 'ctrl-0'
+
+
+@pytest.mark.django_db
+def test_heartbeat_sweeps_on_its_own_clock(heartbeat_settings, me_inst):
+    clock = FakeClock()
+    with (
+        mock.patch.object(system, '_heartbeat_instance_management', return_value=(me_inst, [], [], None)),
+        mock.patch.object(system, '_get_active_task_ids_from_dispatcherd', return_value=[]),
+        mock.patch.object(system, '_process_running_jobs'),
+        mock.patch.object(system, '_sweep_orphaned_jobs') as sweep,
+    ):
+        run_heartbeat(mock.Mock(), clock=clock)
+
+    assert sweep.call_args.kwargs['clock'] is clock

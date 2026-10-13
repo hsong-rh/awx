@@ -741,7 +741,7 @@ def run_heartbeat(binder, clock=None):
     # from the Instance table entirely, which neither _process_running_jobs (it only looks at
     # jobs this node owns) nor the lost-instance path (it keys on the row it just deleted)
     # can see. Runs on every node, so adoption load is no longer winner-takes-all.
-    _sweep_orphaned_jobs(this_inst)
+    _sweep_orphaned_jobs(this_inst, clock=clock)
 
     # If waiting jobs are hanging out, resubmit them
     if UnifiedJob.objects.filter(controller_node=settings.CLUSTER_HOST_ID, status='waiting').exists():
@@ -1131,7 +1131,7 @@ def _dispatch_adoption(job, new_controller=None):
     return task_id
 
 
-def _sweep_orphaned_jobs(this_inst):
+def _sweep_orphaned_jobs(this_inst, clock=None):
     """Adopt running jobs whose controller is no longer a live instance.
 
     The lost-instance path is one-shot and winner-takes-all: the pod that wins
@@ -1152,9 +1152,12 @@ def _sweep_orphaned_jobs(this_inst):
     so _adoption_slot_available() sees it on the next iteration: this node takes what it can
     hold and leaves the rest owned by the dead controller, where the peer's own sweep will
     find them.
+
+    clock returns the current time and defaults to django.utils.timezone.now; the grace
+    period for an unavailable controller is measured on it.
     """
     grace_seconds = settings.CLUSTER_NODE_HEARTBEAT_PERIOD * settings.CLUSTER_NODE_MISSED_HEARTBEAT_TOLERANCE
-    live_hostnames = live_controller_hostnames(Instance.objects.only('hostname', 'node_state', 'last_seen'), now(), grace_seconds)
+    live_hostnames = live_controller_hostnames(Instance.objects.only('hostname', 'node_state', 'last_seen'), (clock or now)(), grace_seconds)
 
     workflow_ctype_id = ContentType.objects.get_for_model(WorkflowJob).id
     orphans = (
@@ -1422,9 +1425,8 @@ def adopt_job(job_id, open_work, clock=None, owner_task_id=None):
     """Adopt one orphaned job this controller has claimed: reattach to its work unit or time it out.
 
     open_work returns the ReceptorWork to stream from; it is called once ownership is
-    confirmed and there is capacity for the job. clock defaults to
-    django.utils.timezone.now and is passed to the reattach; the stall budgets still read
-    the real clock.
+    confirmed and there is capacity for the job. clock returns the current time, defaults
+    to django.utils.timezone.now, and is what every deadline in the adoption is judged by.
     """
     clock = clock or now
 
@@ -1451,7 +1453,7 @@ def adopt_job(job_id, open_work, clock=None, owner_task_id=None):
         # the controller full — the same condition that parked it. Without a deadline the
         # backlog only ever grows (observed: 570 jobs, still climbing after 100+ minutes).
         # Failing the oldest releases capacity for the rest.
-        if _adoption_stall_budget_exhausted(job, 'capacity'):
+        if _adoption_stall_budget_exhausted(job, 'capacity', clock=clock):
             logger.error(f'Job {job_id} could not be adopted within HADR_JOB_ADOPTION_TIMEOUT while this controller was out of control capacity, failing')
             reaper.reap_job(job, 'failed', job_explanation='Job exceeded HADR_JOB_ADOPTION_TIMEOUT waiting for control capacity to adopt it')
             return
@@ -1500,12 +1502,12 @@ def adopt_job(job_id, open_work, clock=None, owner_task_id=None):
                 from awx.main.tasks.container_groups import adopt_container_group_job
 
                 try:
-                    adopt_container_group_job(job, receptor_ctl=work.receptor_ctl, owner_task_id=owner_task_id)
+                    adopt_container_group_job(job, receptor_ctl=work.receptor_ctl, owner_task_id=owner_task_id, clock=clock)
                 except Exception:
                     logger.exception(f'adopt_job_async: container-group adoption failed for job {job.id}')
                 return
 
-            if _adoption_stall_budget_exhausted(job, 'unreachable'):
+            if _adoption_stall_budget_exhausted(job, 'unreachable', clock=clock):
                 logger.error(f'Job {job.id} (unit={job.work_unit_id}) unreachable for >{settings.HADR_JOB_ADOPTION_TIMEOUT}s, failing')
                 # Best effort only: we only get here because the unit is unreachable, so the
                 # cancel is expected to fail too. Not worth a traceback. The unit is not leaked —
