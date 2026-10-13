@@ -206,12 +206,14 @@ def test_stalled_stream_is_finalized_once_stalled_past_the_budget(adoption_env, 
         adopt_job(job.id, open_work=lambda: work, clock=clock)
         job.refresh_from_db()
         assert job.status == 'running', 'a stalled stream defers'
+        assert UNIT in work.units, 'and keeps the unit for a later attempt'
 
         clock.advance(TIMEOUT + 1)
         adopt_job(job.id, open_work=lambda: work, clock=clock)
 
     job.refresh_from_db()
     assert job.status == 'successful', 'past the budget the unit status decides'
+    assert UNIT not in work.units, 'and the unit is released'
 
 
 # ── The orphan sweep on the injected clock ───────────────────────────────────

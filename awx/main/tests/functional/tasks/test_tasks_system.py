@@ -1323,7 +1323,7 @@ def test_adoption_counter_skip_dedup():
     # no assertion — just verify no exception
 
 
-# ── reattach_to_work_unit branch coverage ────────────────────────────────────
+# ── _finalize_job_run coverage ──────────────────────────────────────────────
 
 
 @pytest.mark.django_db
