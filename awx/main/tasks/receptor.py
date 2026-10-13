@@ -2,7 +2,7 @@
 from base64 import b64encode
 from collections import namedtuple
 import concurrent.futures
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 import io
 import json
@@ -44,6 +44,7 @@ from awx.main.tasks.signals import signal_state, signal_callback, SignalExit
 from awx.main.tasks.callback import RunnerCallback
 from awx.main.utils.update_model import NotOwner
 from awx.main.tasks.adoption import invoke_adoption_hooks
+from awx.main.tasks.adoption_decisions import stall_budget_exhausted
 from awx.main.models import Instance, InstanceLink, UnifiedJob, ReceptorAddress
 from awx.main.dispatch import get_task_queuename
 
@@ -1437,13 +1438,8 @@ def _adoption_stall_budget_exhausted(job, reason):
     'capacity', 'unreachable' or 'stall' and each has its own clock: a successful status query
     precedes every stalled-stream retry, so a shared clock would never let the stall converge.
 
-    The clock starts at the first deferral this controller records, not at the job's last
-    event. A playbook can legitimately run for longer than the timeout without emitting an
-    event, and measuring from that event failed such a job on its very first transient error
-    after a controller restart. An event persisted after the first deferral proves progress,
-    so the newer of the two is used.
-
-    The first-deferral time lives in this controller's cache. Losing it (cache restart,
+    The clock starts at the first deferral this controller records; see
+    stall_budget_exhausted for the rule. The first-deferral time lives in this controller's cache. Losing it (cache restart,
     eviction, another controller adopting) only restarts the clock, which defers longer but
     never fails a job early. For the same reason, with no clock to read, the caller defers.
     """
@@ -1460,9 +1456,7 @@ def _adoption_stall_budget_exhausted(job, reason):
     if stalled_since is None:
         return False
     last_event_time = job.get_event_queryset().aggregate(Max('created'))['created__max']
-    if last_event_time and last_event_time > stalled_since:
-        stalled_since = last_event_time
-    return stalled_since < now() - timedelta(seconds=timeout)
+    return stall_budget_exhausted(stalled_since, last_event_time, now(), timeout)
 
 
 def get_adoption_unit_status(work, job):

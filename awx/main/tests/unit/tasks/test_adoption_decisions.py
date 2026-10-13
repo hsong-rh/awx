@@ -8,7 +8,6 @@ from awx.main.models import Instance
 from awx.main.tasks.adoption_decisions import (
     JobAction,
     LostInstanceAction,
-    adoption_deadline_passed,
     adoption_slot_available,
     find_lost_instances,
     live_controller_hostnames,
@@ -16,6 +15,7 @@ from awx.main.tasks.adoption_decisions import (
     lost_instance_disposition,
     lost_instance_job_action,
     running_job_action,
+    stall_budget_exhausted,
     startup_job_action,
 )
 
@@ -273,29 +273,31 @@ class TestRunningJobAction:
         assert self.decide(make_job(), active_task_ids=()) == JobAction.ADOPT
 
 
-class TestAdoptionDeadline:
+class TestStallBudget:
     TIMEOUT = 300
 
-    def test_recent_event_is_within_deadline(self):
-        assert not adoption_deadline_passed(NOW - timedelta(seconds=299), NOW - timedelta(hours=1), NOW, self.TIMEOUT)
+    def exhausted(self, stalled_for, last_event_ago=None):
+        stalled_since = None if stalled_for is None else NOW - timedelta(seconds=stalled_for)
+        last_event = None if last_event_ago is None else NOW - timedelta(seconds=last_event_ago)
+        return stall_budget_exhausted(stalled_since, last_event, NOW, self.TIMEOUT)
 
-    def test_old_last_event_is_past_deadline(self):
-        assert adoption_deadline_passed(NOW - timedelta(seconds=301), NOW - timedelta(hours=1), NOW, self.TIMEOUT)
+    def test_stall_within_the_budget_waits(self):
+        assert not self.exhausted(stalled_for=self.TIMEOUT)
 
-    def test_last_event_wins_over_start_time(self):
-        # A long job that is still producing events is not timed out by its age.
-        assert not adoption_deadline_passed(NOW - timedelta(seconds=10), NOW - timedelta(days=1), NOW, self.TIMEOUT)
+    def test_stall_past_the_budget_is_exhausted(self):
+        assert self.exhausted(stalled_for=self.TIMEOUT + 1)
 
-    def test_start_time_used_when_no_events(self):
-        assert adoption_deadline_passed(None, NOW - timedelta(seconds=301), NOW, self.TIMEOUT)
-        assert not adoption_deadline_passed(None, NOW - timedelta(seconds=299), NOW, self.TIMEOUT)
+    def test_quiet_job_is_not_failed_on_its_first_stall(self):
+        # AAP-96829: a playbook task can run silently for longer than the timeout. The budget
+        # starts at the first stall this controller records, not at the last event.
+        assert not self.exhausted(stalled_for=1, last_event_ago=self.TIMEOUT * 10)
 
-    def test_job_with_no_events_or_start_is_never_past_deadline(self):
-        assert not adoption_deadline_passed(None, None, NOW, self.TIMEOUT)
+    def test_event_saved_after_the_stall_began_restarts_the_budget(self):
+        assert not self.exhausted(stalled_for=self.TIMEOUT * 2, last_event_ago=10)
 
-    def test_quiet_job_is_past_deadline_even_while_healthy(self):
-        # A playbook task that runs silently longer than the timeout (a long pause, a slow
-        # package install) looks the same as a dead one (AAP-96829; the expected behavior
-        # is in test_scenarios_adoption.py).
-        last_event = NOW - timedelta(seconds=self.TIMEOUT + 1)
-        assert adoption_deadline_passed(last_event, NOW - timedelta(seconds=self.TIMEOUT + 60), NOW, self.TIMEOUT)
+    def test_event_saved_before_the_stall_began_does_not_extend_it(self):
+        assert self.exhausted(stalled_for=self.TIMEOUT + 1, last_event_ago=self.TIMEOUT * 2)
+
+    def test_unknown_stall_start_never_exhausts_the_budget(self):
+        # A lost cache entry only restarts the budget, which defers longer but never fails early.
+        assert not self.exhausted(stalled_for=None, last_event_ago=self.TIMEOUT * 10)
