@@ -8,9 +8,10 @@ the run, and the marker comes off.
 from unittest import mock
 
 import pytest
+from django.utils.timezone import now, timedelta
 
-from awx.main.models import Job
-from awx.main.tests.adoption_cluster import EXEC, PEER, THIS, UNIT, configure, make_cluster, mesh, run_lost_instance_handling
+from awx.main.models import Instance, Job
+from awx.main.tests.adoption_cluster import EXEC, GRACE, PEER, THIS, UNIT, configure, make_cluster, mesh, run_lost_instance_handling
 
 
 @pytest.fixture(autouse=True)
@@ -65,3 +66,20 @@ def test_slow_controller_job_sends_no_failed_notification(peer_job):
         run_lost_instance_handling(mesh(PEER, EXEC))
 
     assert mock.call('failed') not in send.call_args_list
+
+
+@pytest.mark.xfail(strict=True, reason='gist 2.11, no Jira bug filed yet: an execution node still on the mesh is handled as lost and its live jobs reaped')
+@pytest.mark.django_db
+def test_execution_node_still_on_the_mesh_keeps_its_jobs():
+    # 2.11 False lost-node report. receptor-1 missed its check-ins, so its last_seen is
+    # stale, but ctrl-0 is still connected to it on the mesh and ctrl-0's own job is still
+    # running there. The mesh gate defers only control nodes, so receptor-1 is handled as
+    # lost and ctrl-0's live job is marked failed while its playbook runs on.
+    make_cluster()
+    Instance.objects.filter(hostname=EXEC).update(last_seen=now() - timedelta(seconds=GRACE + 600))
+    job = Job.objects.create(controller_node=THIS, execution_node=EXEC, status='running', work_unit_id=UNIT, celery_task_id='job-task', started=now())
+
+    run_lost_instance_handling(mesh(PEER, EXEC))
+
+    job.refresh_from_db()
+    assert job.status == 'running'
