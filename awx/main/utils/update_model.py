@@ -19,8 +19,13 @@ class NotOwner(Exception):
         super().__init__(f'pk={pk} is owned by task {current_task_id!r}, not {owner_task_id!r}')
 
 
-def _write_fields(model, pk, select_for_update, owner_task_id, updates):
-    """Load the row, check ownership, and save the given fields in one transaction."""
+def _write_fields(model, pk, select_for_update, owner_task_id, updates, required_status=None):
+    """Load the row, check ownership and status, and save the given fields in one transaction.
+
+    Both checks run inside the select_for_update transaction, so check and write are atomic.
+    required_status: when set, nothing is written and None is returned if the row's current
+    status differs. This is the double-finalization fence from #16669.
+    """
     with transaction.atomic():
         # Retrieve the model instance.
         if select_for_update:
@@ -30,6 +35,9 @@ def _write_fields(model, pk, select_for_update, owner_task_id, updates):
 
         if owner_task_id and instance.celery_task_id != owner_task_id:
             raise NotOwner(pk, owner_task_id, instance.celery_task_id)
+
+        if required_status is not None and instance.status != required_status:
+            return None
 
         # Update the appropriate fields and save the model
         # instance, then return the new instance.
@@ -52,17 +60,20 @@ def _wait_before_retry(pk):
             raise RuntimeError(f'Could not fetch {pk} because of receiving abort signal')
 
 
-def update_model(model, pk, _attempt=0, _max_attempts=5, select_for_update=False, owner_task_id=None, **updates):
+def update_model(model, pk, _attempt=0, _max_attempts=5, select_for_update=False, owner_task_id=None, _required_status=None, **updates):
     """Reload the model instance from the database and update the
     given fields.
 
     With owner_task_id, the row is locked and updated only while its celery_task_id
     still equals owner_task_id; otherwise NotOwner is raised and nothing is written.
+
+    _required_status: when set, the update is skipped and None is returned if the row's
+    current status does not match.
     """
     if owner_task_id:
         select_for_update = True
     try:
-        return _write_fields(model, pk, select_for_update, owner_task_id, updates)
+        return _write_fields(model, pk, select_for_update, owner_task_id, updates, required_status=_required_status)
     except ObjectDoesNotExist:
         return None
     except (DatabaseError, InterfaceError) as e:
@@ -76,5 +87,12 @@ def update_model(model, pk, _attempt=0, _max_attempts=5, select_for_update=False
             raise
         _wait_before_retry(pk)
         return update_model(
-            model, pk, _attempt=_attempt + 1, _max_attempts=_max_attempts, select_for_update=select_for_update, owner_task_id=owner_task_id, **updates
+            model,
+            pk,
+            _attempt=_attempt + 1,
+            _max_attempts=_max_attempts,
+            select_for_update=select_for_update,
+            owner_task_id=owner_task_id,
+            _required_status=_required_status,
+            **updates,
         )
