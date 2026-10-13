@@ -79,6 +79,8 @@ from awx.main.tasks.adoption_decisions import (
     find_lost_instances,
     gate_lost_instances,
     live_controller_hostnames,
+    mesh_hostnames,
+    room_for_another_controllers_job,
     lost_instance_disposition,
     lost_instance_job_action,
     running_job_action,
@@ -907,7 +909,7 @@ def _handle_lost_instance_job(j, other_inst):
     # by our caller, so a peer picks it up on its next heartbeat. Claim first and the job is
     # ours for good: a claim sets controller_node to a live node, and the sweep never steals
     # from a live node, which is how one pod used to end up with every job.
-    action = lost_instance_job_action(j, other_inst.hostname, lambda: _adoption_slot_available(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT))
+    action = lost_instance_job_action(j, other_inst.hostname, lambda: _room_for_another_controllers_job(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT))
 
     if action == JobAction.DEFER:
         logger.info(f'Cross-controller adoption deferred for job {j.id}: no control capacity here, leaving it for another controller to sweep')
@@ -1130,7 +1132,7 @@ def _dispatch_adoption(job, new_controller=None):
     return task_id
 
 
-def _sweep_orphaned_jobs(this_inst, clock=None):
+def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None):
     """Adopt running jobs whose controller is no longer a live instance.
 
     The lost-instance path is one-shot and winner-takes-all: the pod that wins
@@ -1153,10 +1155,14 @@ def _sweep_orphaned_jobs(this_inst, clock=None):
     find them.
 
     clock returns the current time and defaults to django.utils.timezone.now; the grace
-    period for an unavailable controller is measured on it.
+    period for an unavailable controller is measured on it. mesh_lookup returns the
+    hostnames on the receptor mesh, or None when receptor cannot be read; it is asked only
+    when an orphan's controller has no Instance row, and defaults to this node's receptor.
     """
     grace_seconds = settings.CLUSTER_NODE_HEARTBEAT_PERIOD * settings.CLUSTER_NODE_MISSED_HEARTBEAT_TOLERANCE
-    live_hostnames = live_controller_hostnames(Instance.objects.only('hostname', 'node_state', 'last_seen'), (clock or now)(), grace_seconds)
+    ref_time = (clock or now)()
+    instances = list(Instance.objects.only('hostname', 'node_state', 'last_seen'))
+    live_hostnames = live_controller_hostnames(instances, ref_time, grace_seconds)
 
     workflow_ctype_id = ContentType.objects.get_for_model(WorkflowJob).id
     orphans = (
@@ -1179,11 +1185,12 @@ def _sweep_orphaned_jobs(this_inst, clock=None):
         .order_by('started')  # longest-stranded first: they are closest to their deadline
         .values_list('id', 'controller_node', 'celery_task_id', named=True)[: settings.HADR_ORPHAN_SWEEP_MAX_PER_HEARTBEAT]
     )
+    orphans = _exclude_live_controllers_without_rows(list(orphans), instances, ref_time, grace_seconds, mesh_lookup or _receptor_mesh_hostnames)
 
     swept = 0
-    for orphan in list(orphans):
+    for orphan in orphans:
         try:
-            if not _adoption_slot_available():
+            if not _room_for_another_controllers_job():
                 logger.info(f'Orphan sweep stopping at {swept} adoptions: out of control capacity, peer or next heartbeat takes the rest')
                 break
             if _dispatch_adoption(orphan, new_controller=this_inst.hostname) is None:
@@ -1197,6 +1204,42 @@ def _sweep_orphaned_jobs(this_inst, clock=None):
 
     if swept:
         logger.info(f'Orphan sweep queued {swept} adoption(s) for jobs whose controller is gone')
+
+
+def _exclude_live_controllers_without_rows(orphans, instances, ref_time, grace_seconds, mesh_lookup):
+    """Drop the orphans whose controller has no Instance row but is still on the receptor mesh.
+
+    Deprovisioning a live controller deletes its row while it still streams its jobs (2.4).
+    The mesh is only consulted when such an orphan exists. When it cannot be read, those
+    orphans are left for a later heartbeat rather than risk a second stream of a live job.
+    Kubernetes control pods are not peered on the mesh, so there a controller without a row
+    is still treated as gone.
+    """
+    with_rows = {inst.hostname for inst in instances}
+    if all(orphan.controller_node in with_rows for orphan in orphans):
+        return orphans
+    on_mesh = mesh_lookup()
+    if on_mesh is None:
+        logger.warning('Orphan sweep: receptor mesh unreadable, leaving jobs of controllers with no instance record for a later heartbeat')
+        return [orphan for orphan in orphans if orphan.controller_node in with_rows]
+    live = live_controller_hostnames(instances, ref_time, grace_seconds, mesh_hostnames=on_mesh)
+    return [orphan for orphan in orphans if orphan.controller_node not in live]
+
+
+def _receptor_mesh_hostnames():
+    """The nodes on the receptor mesh as this node sees it, or None when receptor cannot be read."""
+    try:
+        ctl = get_receptor_ctl()
+    except FileNotFoundError:
+        return None
+    try:
+        status = _receptor_mesh_status(ctl)
+    finally:
+        try:
+            ctl.close()
+        except Exception:
+            pass
+    return None if status is None else mesh_hostnames(status)
 
 
 def _current_namespace():
@@ -1392,6 +1435,20 @@ def _adoption_slot_available(headroom_needed=0):
         logger.warning('Could not read the control capacity of this instance; proceeding with this adoption', exc_info=True)
         return True
     return adoption_slot_available(me.capacity, me.remaining_capacity, headroom_needed=headroom_needed)
+
+
+def _room_for_another_controllers_job(headroom_needed=0):
+    """May this controller take a lost controller's job? See room_for_another_controllers_job.
+
+    Fails closed, unlike _adoption_slot_available: a job declined here stays owned by the lost
+    controller, so another controller's sweep or a later heartbeat still finds it.
+    """
+    try:
+        me = Instance.objects.me()
+    except Exception:
+        logger.warning('Could not read this instance; not taking jobs from other controllers this time', exc_info=True)
+        return False
+    return room_for_another_controllers_job(me.enabled, me.capacity, me.remaining_capacity, headroom_needed=headroom_needed)
 
 
 @task(queue=get_task_queuename, on_duplicate='discard')
