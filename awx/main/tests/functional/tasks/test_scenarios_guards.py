@@ -10,6 +10,9 @@ Heartbeats run through cluster_node_heartbeat, the dispatcher's entry point, so 
 new path it gains (an orphan sweep, for example) runs in these tests too.
 """
 
+import contextlib
+from unittest import mock
+
 import pytest
 from django.utils.timezone import now, timedelta
 
@@ -164,16 +167,24 @@ def test_restarted_controller_keeps_its_capacity_and_adopts_its_job():
 # ── Claims a node must not make ───────────────────────────────────────────────
 
 
+@contextlib.contextmanager
 def disabled_node():
     Instance.objects.filter(hostname=THIS).update(enabled=False, capacity=0)
-    return []
+    yield []
 
 
+@contextlib.contextmanager
 def full_node():
-    Instance.objects.filter(hostname=THIS).update(capacity=1)
-    for n in range(2):
-        running_job(THIS, task_id=f'filler-{n}', work_unit_id=f'filler-unit-{n}', task_impact=1)
-    return ['filler-0', 'filler-1']
+    # The heartbeat's health check sizes the node from this machine's CPU and memory, which
+    # would overwrite capacity=1 with a real figure. Pin both to one job's worth while it runs.
+    with (
+        mock.patch('awx.main.models.ha.get_cpu_effective_capacity', return_value=1),
+        mock.patch('awx.main.models.ha.get_mem_effective_capacity', return_value=1),
+    ):
+        Instance.objects.filter(hostname=THIS).update(capacity=1)
+        for n in range(2):
+            running_job(THIS, task_id=f'filler-{n}', work_unit_id=f'filler-unit-{n}', task_impact=1)
+        yield ['filler-0', 'filler-1']
 
 
 @pytest.mark.parametrize(
@@ -190,9 +201,8 @@ def test_node_without_room_does_not_take_a_lost_controllers_job(make_room):
     # job either: the claim would sit with no room to run the adoption.
     make_cluster()
     job = running_job(PEER, task_id='peer-task')
-    fillers = make_room()
-
-    queued = heartbeat(THIS, mesh(EXEC), running_task_ids=fillers)
+    with make_room() as fillers:
+        queued = heartbeat(THIS, mesh(EXEC), running_task_ids=fillers)
 
     assert queued == []
     job.refresh_from_db()

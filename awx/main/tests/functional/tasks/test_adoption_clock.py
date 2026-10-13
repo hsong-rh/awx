@@ -132,22 +132,23 @@ def test_orphan_within_the_deadline_is_adopted(adoption_env, orphan):
 
     job.refresh_from_db()
     assert job.status == 'successful'
-    assert job.finished == clock()
+    # finished is when the playbook ended, taken from its last event, never after the adoption.
+    assert job.started <= job.finished <= clock()
     assert RecordingDispatcher.counters() == list(range(2, 11))
     assert ('close',) in work.calls
 
 
 @pytest.mark.django_db
-def test_orphan_past_the_deadline_is_failed_without_contacting_receptor(adoption_env, orphan):
+def test_orphan_silent_past_the_deadline_is_still_streamed_while_its_unit_answers(adoption_env, orphan):
+    # Silence since the last event is not a deadline: a quiet playbook looks the same
+    # (AAP-96829). Only a unit that cannot be reached is failed, after the stall budget.
     job, last_event = orphan
-    opened = mock.Mock()
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10))})
 
-    adopt_job(job.id, open_work=opened, clock=FakeClock(last_event + timedelta(seconds=TIMEOUT + 1)))
+    adopt_job(job.id, open_work=lambda: work, clock=FakeClock(last_event + timedelta(seconds=TIMEOUT + 1)))
 
     job.refresh_from_db()
-    assert job.status == 'failed'
-    assert 'HADR_JOB_ADOPTION_TIMEOUT' in job.job_explanation
-    opened.assert_not_called()
+    assert job.status == 'successful'
 
 
 # ── Stall budgets on the injected clock ──────────────────────────────────────

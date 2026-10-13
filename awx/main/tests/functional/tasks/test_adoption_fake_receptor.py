@@ -85,15 +85,16 @@ def test_failed_playbook_finalizes_failed(running_job):
 
 
 @pytest.mark.django_db
-def test_unit_still_running_is_deferred(running_job):
+def test_unit_still_running_is_streamed_live(running_job):
+    # A running unit is read the way a normal run reads it, event by event as it goes, not
+    # held back until the playbook ends.
     work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10), state='Running')})
 
-    assert reattach_to_work_unit(running_job, work) is False
+    assert reattach_to_work_unit(running_job, work) is True
 
     running_job.refresh_from_db()
-    assert running_job.status == 'running'
-    assert RecordingDispatcher.dispatched == []
-    assert UNIT in work.units
+    assert running_job.status == 'successful'
+    assert RecordingDispatcher.counters() == list(range(1, 11))
 
 
 @pytest.mark.django_db
