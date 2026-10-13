@@ -2176,3 +2176,27 @@ def test_handle_work_error_does_not_detach_running_when_canceled():
 
     assert result is err_res
     assert rj.detached is False
+
+
+@pytest.mark.parametrize(
+    'task_class_name, callback_class_name',
+    [('RunJob', 'RunnerCallback'), ('RunInventoryUpdate', 'RunnerCallbackForInventoryUpdate'), ('RunProjectUpdate', 'RunnerCallbackForProjectUpdate')],
+)
+def test_adoption_uses_the_callback_class_of_the_jobs_own_task(task_class_name, callback_class_name):
+    from awx.main.tasks import jobs
+    from awx.main.tasks.receptor import _adoption_callback_class
+
+    job = Mock()
+    job._get_task_class.return_value = getattr(jobs, task_class_name)
+
+    assert _adoption_callback_class(job).__name__ == callback_class_name
+
+
+def test_adoption_falls_back_to_the_plain_callback_without_a_task_class():
+    from awx.main.tasks.callback import RunnerCallback
+    from awx.main.tasks.receptor import _adoption_callback_class
+
+    job = Mock()
+    job._get_task_class.side_effect = NotImplementedError
+
+    assert _adoption_callback_class(job) is RunnerCallback

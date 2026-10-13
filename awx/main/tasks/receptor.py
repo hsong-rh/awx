@@ -1220,9 +1220,21 @@ def _get_adoption_exit_code(unit_status, state_name):
         return 0 if state_name == 'Succeeded' else 1
 
 
+def _adoption_callback_class(job):
+    """The callback class a normal run of this job uses, so its post-run hook finds what it tracks.
+
+    RunInventoryUpdate's hook reads end_line and RunProjectUpdate's the new revision, which only
+    their own callback classes record.
+    """
+    try:
+        return getattr(job._get_task_class(), 'callback_class', RunnerCallback)
+    except (NotImplementedError, AttributeError):
+        return RunnerCallback
+
+
 def _build_adoption_callback(job, dedup_threshold, collision_zone):
-    """Construct a RunnerCallback for event replay during adoption."""
-    callback = RunnerCallback.create_for_job(
+    """Construct the job type's RunnerCallback for event replay during adoption."""
+    callback = _adoption_callback_class(job).create_for_job(
         job,
         safe_env=dict(job.job_env or {}),
         dedup_threshold=dedup_threshold,
@@ -1651,7 +1663,10 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
     private_data_dir = _get_or_create_private_data_dir(job)
     adoption_task = _AdoptionTask(job, callback)
     adoption_task.private_data_dir = private_data_dir  # Available to final_run_hook
-    receptor_job = AWXReceptorJob(adoption_task, {'private_data_dir': private_data_dir})
+    # ident names the artifact directory, artifacts/<job id>, as on the normal run path. The
+    # worker streams that directory's contents, and the post-run hooks (fact cache, inventory
+    # import) read them from there; without it they land one level up and are never found.
+    receptor_job = AWXReceptorJob(adoption_task, {'private_data_dir': private_data_dir, 'ident': job.id})
     receptor_job.unit_id = unit_id
     receptor_job.stream_idle_timeout = settings.HADR_ADOPTION_STREAM_IDLE_TIMEOUT
 

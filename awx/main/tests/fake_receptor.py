@@ -9,6 +9,10 @@ Failures are injected per unit:
     connection to the execution node drops.
   - status_error: status() raises, as when the node is unreachable. adopt() and cancel() raise too.
   - results_error: results() raises, as when the results stream cannot be opened or breaks.
+  - artifacts: files the playbook left in its artifact directory, {relative path: content}
+    or {relative path: (content, seconds_old)}. They are streamed the way an ansible-runner
+    worker streams them: a zip of the artifact directory, paths relative to it, file
+    modification times preserved.
   - remote_only: this controller's receptor does not hold the unit, so status() and results()
     raise until adopt() takes it over from the execution node.
   - released units disappear, and releasing or reading an unknown unit raises like receptor.
@@ -17,9 +21,12 @@ RecordingDispatcher replaces CallbackQueueDispatcher so tests can see the events
 would have gone to the callback receiver.
 """
 
+import base64
 import io
 import json
+import time
 import uuid
+import zipfile
 
 from awx.main.tasks.receptor import ReceptorWork
 
@@ -54,7 +61,17 @@ def make_events(count, failed_tasks=()):
 
 class FakeWorkUnit:
     def __init__(
-        self, events=(), status='successful', state=None, exit_code=None, detail='', break_after=None, status_error=None, remote_only=False, results_error=None
+        self,
+        events=(),
+        status='successful',
+        state=None,
+        exit_code=None,
+        detail='',
+        break_after=None,
+        status_error=None,
+        remote_only=False,
+        results_error=None,
+        artifacts=None,
     ):
         self.events = list(events)
         self.status = status
@@ -65,16 +82,31 @@ class FakeWorkUnit:
         self.status_error = status_error
         self.remote_only = remote_only
         self.results_error = results_error
+        self.artifacts = artifacts or {}
+
+    def _artifacts_zip(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for path, content in self.artifacts.items():
+                content, seconds_old = content if isinstance(content, tuple) else (content, 0)
+                info = zipfile.ZipInfo(path, date_time=time.localtime(time.time() - seconds_old)[:6])
+                info.external_attr = 0o644 << 16
+                archive.writestr(info, content)
+        return buffer.getvalue()
 
     def stream(self):
         lines = []
         events = self.events if self.break_after is None else self.events[: self.break_after]
         for event in events:
             lines.append(json.dumps(event))
+        data = ('\n'.join(lines) + '\n').encode() if lines else b''
         if self.break_after is None:
-            lines.append(json.dumps({'status': self.status, 'runner_ident': 'fake'}))
-            lines.append(json.dumps({'eof': True}))
-        return ('\n'.join(lines) + '\n').encode() if lines else b''
+            if self.artifacts:
+                # The base64 runs straight into the next line, as the worker writes it.
+                archive = self._artifacts_zip()
+                data += json.dumps({'zipfile': len(archive)}).encode() + b'\n' + base64.b64encode(archive)
+            data += (json.dumps({'status': self.status, 'runner_ident': 'fake'}) + '\n' + json.dumps({'eof': True}) + '\n').encode()
+        return data
 
 
 class FakeSocket:
