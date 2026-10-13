@@ -18,6 +18,8 @@ class JobAction(str, Enum):
     SKIP = 'skip'
     ADOPT = 'adopt'
     REAP = 'reap'
+    DEFER = 'defer'  # adoptable, but not here and not now; left for another controller
+    REQUEUE = 'requeue'  # never reached an execution environment; back to pending
 
 
 class LostInstanceAction(str, Enum):
@@ -54,12 +56,21 @@ def gate_lost_instances(lost_instances, mesh_ready):
     return [inst for inst in lost_instances if inst.node_type in ('execution', 'hop')]
 
 
-def lost_instance_job_action(job):
+def lost_instance_job_action(job, lost_hostname, slot_available):
     """What to do with a running job whose controller or execution node was lost.
 
-    AAP-89602: cross-controller adoption for dispatched jobs will return ADOPT here
-    once ansible/receptor#1564 merges. Until then every such job is reaped.
+    A job dispatched to receptor whose controller was lost is adopted if its playbook ran on
+    another node, which outlived the controller. It is deferred instead when this controller
+    has no room: it stays owned by the lost controller, so another controller's orphan sweep
+    still finds it. A job that never reached an execution environment goes back to pending.
+    Anything else is reaped.
+
+    slot_available is a callable, asked only for a job that would be adopted.
     """
+    if job.work_unit_id and job.controller_node == lost_hostname and job.execution_node != lost_hostname:
+        return JobAction.ADOPT if slot_available() else JobAction.DEFER
+    if not job.started and not job.work_unit_id:
+        return JobAction.REQUEUE
     return JobAction.REAP
 
 
