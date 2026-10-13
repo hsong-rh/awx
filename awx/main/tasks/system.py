@@ -90,7 +90,6 @@ from awx.main.tasks.receptor import (
     ReceptorWork,
     _adoption_stall_budget_exhausted,
     administrative_workunit_reaper,
-    reset_receptor_connection,
     clear_adoption_stall,
     get_adoption_unit_status,
     get_receptor_ctl,
@@ -1577,17 +1576,16 @@ def awx_receptor_workunit_reaper():
         # commands then raise. UnifiedJob orders by id, so letting that escape wedges every later
         # pass on the same unit: the units behind it leak and administrative_workunit_reaper below
         # never runs. The cancel is only the precaution the docstring describes, so it is guarded
-        # separately -- a remote that refuses it still has local files to release.
+        # separately -- a remote that refuses it still has local files to release. ReceptorWork
+        # drops the connection after a failed command, so the next one does not read its error.
         try:
             work.cancel(job.work_unit_id)
         except Exception as exc:
             logger.warning(f"Could not cancel receptor work unit {job.work_unit_id} for {job.log_format}: {exc}")
-            reset_receptor_connection(receptor_ctl)
         try:
             work.release(job.work_unit_id)
         except Exception as exc:
             logger.warning(f"Could not release receptor work unit {job.work_unit_id} for {job.log_format}: {exc}")
-            reset_receptor_connection(receptor_ctl)
             # The release failure is most likely because the original controller's local proxy
             # for this unit has a remote that was already cleaned up during adoption on another
             # controller. Receptor's in-memory state still lists the unit; `work release` fails

@@ -223,24 +223,41 @@ class ReceptorWork:
     def __init__(self, receptor_ctl):
         self.receptor_ctl = receptor_ctl
 
+    def _call(self, command, *args, **kwargs):
+        """Run one receptorctl command, dropping the connection if it raises.
+
+        receptorctl leaves the socket a reply behind after an `ERROR:` line (see
+        reset_receptor_connection), so without this the next command would read this one's
+        error. A command after a failure reconnects clean.
+        """
+        try:
+            return command(*args, **kwargs)
+        except Exception:
+            reset_receptor_connection(self.receptor_ctl)
+            raise
+
     def list(self):
-        return self.receptor_ctl.simple_command('work list')
+        return self._call(self.receptor_ctl.simple_command, 'work list')
 
     def status(self, unit_id):
-        return self.receptor_ctl.simple_command(f'work status {unit_id}')
+        return self._call(self.receptor_ctl.simple_command, f'work status {unit_id}')
 
     def results(self, unit_id, startpos=None):
         """Return (socket, file) streaming the unit's ansible-runner output."""
         kwargs = {'return_socket': True, 'return_sockfile': True}
         if startpos is not None:
             kwargs['startpos'] = startpos
-        return self.receptor_ctl.get_work_results(unit_id, **kwargs)
+        return self._call(self.receptor_ctl.get_work_results, unit_id, **kwargs)
 
     def cancel(self, unit_id):
-        return self.receptor_ctl.simple_command(f'work cancel {unit_id}')
+        return self._call(self.receptor_ctl.simple_command, f'work cancel {unit_id}')
 
     def release(self, unit_id):
-        return self.receptor_ctl.simple_command(f'work release {unit_id}')
+        return self._call(self.receptor_ctl.simple_command, f'work release {unit_id}')
+
+    def adopt(self, node, unit_id):
+        """Adopt a unit this receptor does not hold from the node running it."""
+        return self._call(adopt_remote_work, self.receptor_ctl, node, unit_id)
 
     def close(self):
         self.receptor_ctl.close()
@@ -1483,7 +1500,7 @@ def get_adoption_unit_status(work, job):
         if not job.execution_node or job.execution_node == settings.CLUSTER_HOST_ID:
             raise
         logger.info(f'Job {job.id}: unit {unit_id} unknown to local receptor, adopting from execution node {job.execution_node}')
-        return adopt_remote_work(work.receptor_ctl, job.execution_node, unit_id)
+        return work.adopt(job.execution_node, unit_id)
 
 
 def _status_from_host_counts(host_status_counts):

@@ -399,7 +399,8 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id
             namespace = pod['metadata']['namespace']
             receptor_job = AWXReceptorJob(_AdoptionTask(job, None), {'private_data_dir': None})
             unit_id = receptor_job.submit_pod_attach(receptor_ctl, pod_name, namespace)
-            unit_status = receptor_ctl.simple_command(f'work status {unit_id}')
+            work = ReceptorWork(receptor_ctl)
+            unit_status = work.status(unit_id)
         except Exception:
             # A failed submit creates no pod and changes nothing about the job, so this is a
             # statement about this controller's receptor. Defer and re-triage.
@@ -411,7 +412,7 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id
             # Old receptor ignores the pod_name param and creates a new empty pod instead of
             # attaching. Release the broken unit before it wastes resources.
             try:
-                receptor_ctl.simple_command(f'work release {unit_id}')
+                work.release(unit_id)
             except Exception:
                 pass
             logger.error(
@@ -425,9 +426,7 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id
         UnifiedJob.objects.filter(pk=job.pk).update(work_unit_id=unit_id)
         job.work_unit_id = unit_id
 
-        return bool(
-            reattach_to_work_unit(job, ReceptorWork(receptor_ctl), clock=clock, owner_task_id=owner_task_id, unit_status=unit_status, pod_name=pod_name)
-        )
+        return bool(reattach_to_work_unit(job, work, clock=clock, owner_task_id=owner_task_id, unit_status=unit_status, pod_name=pod_name))
     finally:
         if close_ctl:
             try:

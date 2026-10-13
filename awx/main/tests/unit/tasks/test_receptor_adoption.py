@@ -119,6 +119,48 @@ def test_receptor_work_simple_commands(call, command):
     ctl.simple_command.assert_called_once_with(command)
 
 
+@pytest.mark.parametrize(
+    'call',
+    [
+        lambda w: w.list(),
+        lambda w: w.status('unit-1'),
+        lambda w: w.cancel('unit-1'),
+        lambda w: w.release('unit-1'),
+        lambda w: w.results('unit-1'),
+    ],
+)
+def test_receptor_work_drops_the_connection_after_an_error_reply(call):
+    """receptorctl leaves the socket a reply behind after an `ERROR:` line, so the next command
+    would read this one's error. Closing makes the next command reconnect clean."""
+    ctl = Mock()
+    ctl.simple_command.side_effect = RuntimeError('ERROR: unknown work unit unit-1')
+    ctl.get_work_results.side_effect = RuntimeError('ERROR: unknown work unit unit-1')
+
+    with pytest.raises(RuntimeError):
+        call(ReceptorWork(ctl))
+
+    ctl.close.assert_called_once()
+
+
+@patch('awx.main.tasks.receptor.adopt_remote_work')
+def test_receptor_work_adopts_a_unit_from_its_execution_node(mock_adopt_remote):
+    ctl = Mock()
+    mock_adopt_remote.return_value = {'unitid': 'unit-1', 'result': 'Adopted'}
+
+    assert ReceptorWork(ctl).adopt('remote-ee', 'unit-1') == {'unitid': 'unit-1', 'result': 'Adopted'}
+    mock_adopt_remote.assert_called_once_with(ctl, 'remote-ee', 'unit-1')
+
+
+@patch('awx.main.tasks.receptor.adopt_remote_work', side_effect=RuntimeError('no route to remote-ee'))
+def test_receptor_work_drops_the_connection_after_a_failed_adopt(_mock_adopt_remote):
+    ctl = Mock()
+
+    with pytest.raises(RuntimeError):
+        ReceptorWork(ctl).adopt('remote-ee', 'unit-1')
+
+    ctl.close.assert_called_once()
+
+
 def test_receptor_work_results_passes_startpos_only_when_given():
     ctl = Mock()
     work = ReceptorWork(ctl)
@@ -1215,6 +1257,41 @@ def test_adoption_unit_status_falls_back_to_remote_adopt(mock_adopt_remote):
 
     assert status['result'] == 'Adopted'
     mock_adopt_remote.assert_called_once_with(ctl, 'remote-ee', 'unit-1')
+
+
+class _DesyncingCtl:
+    """receptorctl after an `ERROR:` reply: the next command reads that reply until close()."""
+
+    def __init__(self):
+        self.desynced = False
+
+    def simple_command(self, command):
+        if self.desynced:
+            raise ValueError('Expecting value: line 1 column 1 (char 0)')
+        self.desynced = True
+        raise RuntimeError(f'ERROR: unknown work unit {command.split()[-1]}')
+
+    def adopt_work(self, node, unit_id, tlsclient=None, signwork=False):
+        if self.desynced:
+            raise ValueError('Expecting value: line 1 column 1 (char 0)')
+        return {'unitid': unit_id, 'result': 'Adopted'}
+
+    def close(self):
+        self.desynced = False
+
+
+@patch('awx.main.tasks.receptor.work_signing_enabled', return_value=False)
+@patch('awx.main.tasks.receptor.get_tls_client', return_value=None)
+@patch('awx.main.tasks.receptor.read_receptor_config', return_value=[])
+def test_remote_adopt_after_a_failed_local_status_reads_its_own_reply(*_config):
+    """The cross-controller case: the local receptor answers `work status` with an error, then the
+    unit is adopted from the execution node on the same connection. Without a reconnect between
+    the two, the adopt reads the status error instead of its own reply."""
+    from awx.main.tasks.receptor import get_adoption_unit_status
+
+    job = Mock(id=1, work_unit_id='unit-1', execution_node='remote-ee')
+
+    assert get_adoption_unit_status(ReceptorWork(_DesyncingCtl()), job) == {'unitid': 'unit-1', 'result': 'Adopted'}
 
 
 @patch('awx.main.tasks.receptor.adopt_remote_work')

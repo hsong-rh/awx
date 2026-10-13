@@ -7,7 +7,9 @@ protocol the ansible-runner worker writes, so AWX's real process-phase code pars
 Failures are injected per unit:
   - break_after=N: the stream ends after N events with no status or eof, as when the
     connection to the execution node drops.
-  - status_error: status() raises, as when the node is unreachable.
+  - status_error: status() raises, as when the node is unreachable. adopt() raises too.
+  - remote_only: this controller's receptor does not hold the unit, so status() and results()
+    raise until adopt() takes it over from the execution node.
   - released units disappear, and releasing or reading an unknown unit raises like receptor.
 
 RecordingDispatcher replaces CallbackQueueDispatcher so tests can see the events that
@@ -50,7 +52,7 @@ def make_events(count, failed_tasks=()):
 
 
 class FakeWorkUnit:
-    def __init__(self, events=(), status='successful', state=None, exit_code=None, detail='', break_after=None, status_error=None):
+    def __init__(self, events=(), status='successful', state=None, exit_code=None, detail='', break_after=None, status_error=None, remote_only=False):
         self.events = list(events)
         self.status = status
         self.state = state or TERMINAL_STATE.get(status, 'Succeeded')
@@ -58,6 +60,7 @@ class FakeWorkUnit:
         self.detail = detail
         self.break_after = break_after
         self.status_error = status_error
+        self.remote_only = remote_only
 
     def stream(self):
         lines = []
@@ -85,7 +88,7 @@ class FakeReceptorWork(ReceptorWork):
         self.calls = []
 
     def _unit(self, unit_id):
-        if unit_id not in self.units:
+        if unit_id not in self.units or self.units[unit_id].remote_only:
             raise RuntimeError(f'ERROR: unknown work unit {unit_id}')
         return self.units[unit_id]
 
@@ -116,6 +119,16 @@ class FakeReceptorWork(ReceptorWork):
         self.calls.append(('release', unit_id))
         self._unit(unit_id)
         del self.units[unit_id]
+
+    def adopt(self, node, unit_id):
+        self.calls.append(('adopt', node, unit_id))
+        unit = self.units.get(unit_id)
+        if unit is None:
+            raise RuntimeError(f'ERROR: unknown work unit {unit_id} on {node}')
+        if unit.status_error:
+            raise unit.status_error
+        unit.remote_only = False
+        return {'unitid': unit_id, 'result': 'Adopted'}
 
     def close(self):
         self.calls.append(('close',))
