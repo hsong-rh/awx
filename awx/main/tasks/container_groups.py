@@ -35,6 +35,7 @@ from awx.main.models import UnifiedJob
 from awx.main.scheduler.kubernetes import PodManager
 from awx.main.tasks.adoption import invoke_adoption_hooks
 from awx.main.tasks.receptor import (
+    ReceptorWork,
     AWXReceptorJob,
     _AdoptionTask,
     _adoption_stall_budget_exhausted as budget_exhausted,
@@ -415,7 +416,7 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None):
         UnifiedJob.objects.filter(pk=job.pk).update(work_unit_id=unit_id)
         job.work_unit_id = unit_id
 
-        return bool(reattach_to_work_unit(job, receptor_ctl, unit_status=unit_status, pod_name=pod_name))
+        return bool(reattach_to_work_unit(job, ReceptorWork(receptor_ctl), unit_status=unit_status, pod_name=pod_name))
     finally:
         if close_ctl:
             try:

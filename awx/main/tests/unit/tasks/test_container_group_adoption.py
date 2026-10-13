@@ -524,7 +524,9 @@ def test_attach_hands_off_to_the_ordinary_adoption_path(attach_env):
     assert attach_to_streaming_pod(job, 'automation-job-42-abcde', _pod(), receptor_ctl=ctl) is True
 
     ctl.simple_command.assert_called_once_with('work status new-unit-id')
-    assert attach_env['reattach_to_work_unit'].call_args[0] == (job, ctl)
+    reattach_job, reattach_work = attach_env['reattach_to_work_unit'].call_args[0]
+    assert reattach_job is job
+    assert reattach_work.receptor_ctl is ctl
     assert attach_env['reattach_to_work_unit'].call_args.kwargs['unit_status'] == {'StateName': 'Running', 'ExtraData': {'PodName': 'automation-job-42-abcde'}}
 
 

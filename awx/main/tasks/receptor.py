@@ -1565,7 +1565,7 @@ def _finalize_adoption_result(job, callback, res, process_phase_failed, work, un
         if hook_error.get('traceback'):
             callback.delay_update(result_traceback=hook_error['traceback'])
 
-    _finalize_adopted_job(job, callback, exit_code, process_phase_failed, final_status=status, pod_name=pod_name)
+    _finalize_adopted_job(job, callback, exit_code, process_phase_failed, final_status=status, pod_name=pod_name, clock=clock, owner_task_id=owner_task_id)
     return True
 
 
