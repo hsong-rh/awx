@@ -897,31 +897,6 @@ def _heartbeat_check_versions(this_inst, instance_list):
             raise RuntimeError("Shutting down.")
 
 
-def _queue_job_adoption(job_id, source_controller):
-    """Publish adopt_job_async for a job this controller just claimed from another controller.
-
-    Used by the lost-instance path and the orphan sweep, after their controller_node claim.
-    Jobs this controller already owns go through _dispatch_adoption instead. Persisting the
-    id matters because the job still carries the uuid of the dispatch task that died, which
-    would make it look orphaned to every later heartbeat. The id is also the owner_task_id
-    the adoption is fenced by: a later claim replaces it, and this adoption then stops.
-
-    The uuid is chosen here and written before the message goes out, rather than taken from
-    what apply_async hands back. UnifiedJob.cancel() addresses the dispatcher by
-    (controller_node, celery_task_id), and the claim has already moved controller_node to
-    this node, so a cancel issued while the row still carried the dead controller's uuid was
-    published to this node for a task nobody here runs — silently dropped. Writing first
-    makes that window deliver to the adoption worker instead. The row is only ever read by a
-    cancel or by the orphan scan, both of which treat an id with no live worker as orphaned,
-    so recording an id for a publish that then fails costs nothing.
-    """
-    task_id = str(uuid.uuid4())
-    UnifiedJob.objects.filter(pk=job_id).update(celery_task_id=task_id)
-    adopt_job_async.apply_async(
-        args=[job_id], kwargs={'source_controller': source_controller, 'owner_task_id': task_id}, queue=get_task_queuename(), uuid=task_id
-    )
-
-
 def _handle_lost_instance_job(j, other_inst):
     """Process a single job from a lost instance: adopt if possible, reap otherwise."""
     adoptable = j.work_unit_id and j.controller_node == other_inst.hostname and j.execution_node != other_inst.hostname
@@ -951,13 +926,13 @@ def _handle_lost_instance_job(j, other_inst):
         logger.info(f'Cross-controller adoption deferred for job {j.id}: no control capacity here, leaving it for another controller to sweep')
         return
 
-    claimed = UnifiedJob.objects.filter(pk=j.id, controller_node=other_inst.hostname, status='running').update(controller_node=settings.CLUSTER_HOST_ID)
-    if not claimed:
+    task_id = claim_for_adoption(j, new_controller=settings.CLUSTER_HOST_ID)
+    if task_id is None:
         logger.info(f'Cross-controller adoption skipped for job {j.id}: already claimed by another controller')
         return
 
     try:
-        _queue_job_adoption(j.id, settings.CLUSTER_HOST_ID)
+        _publish_adoption(j.id, task_id)
         logger.info(f'Cross-controller adoption queued for job {j.id} (unit={j.work_unit_id}) from lost controller {other_inst.hostname}')
     except Exception:
         logger.exception(f'Failed to queue cross-controller adoption for job {j.id}, reaping instead')
@@ -1123,27 +1098,42 @@ def _process_running_jobs(this_inst, active_task_ids, ref_time):
             logger.exception(f'Failed processing job {j.id} in heartbeat job loop')
 
 
-def claim_for_adoption(job):
+def claim_for_adoption(job, new_controller=None):
     """Make a new adoption task the job's owner. Return its task id, or None if the job changed.
 
-    The claim replaces celery_task_id only if it still holds the value this heartbeat read,
-    so two claims can't both win. Once claimed, the previous owner's final status write is
-    refused (see NotOwner) and cancels go to the adoption task.
+    job is what the caller read: its id, controller_node and celery_task_id. The claim writes
+    a new celery_task_id, and controller_node=new_controller when taking the job from another
+    controller, in one UPDATE that matches only while the row still holds the values read.
+    So of two claims made from the same read, one wins, whether they race on the same
+    controller or across controllers.
+
+    Both fields change together because UnifiedJob.cancel() addresses the dispatcher by
+    (controller_node, celery_task_id). Once claimed, a cancel reaches the adoption task,
+    and the previous owner's final status write is refused (see NotOwner).
     """
     task_id = str(uuid.uuid4())
-    claimed = UnifiedJob.objects.filter(pk=job.id, status='running', celery_task_id=job.celery_task_id).update(celery_task_id=task_id)
+    updates = {'celery_task_id': task_id}
+    if new_controller:
+        updates['controller_node'] = new_controller
+    claimed = UnifiedJob.objects.filter(pk=job.id, status='running', controller_node=job.controller_node, celery_task_id=job.celery_task_id).update(**updates)
     return task_id if claimed else None
 
 
-def _dispatch_adoption(job):
-    """Claim the job, then dispatch its adoption under the claimed task id."""
-    task_id = claim_for_adoption(job)
+def _publish_adoption(job_id, task_id):
+    """Dispatch the adoption of a claimed job under the task id its claim recorded."""
+    adopt_job_async.apply_async(args=[job_id], kwargs={'owner_task_id': task_id}, uuid=task_id, queue=get_task_queuename())
+
+
+def _dispatch_adoption(job, new_controller=None):
+    """Claim the job, then dispatch its adoption under the claimed task id. Return the id, or None."""
+    task_id = claim_for_adoption(job, new_controller=new_controller)
     if task_id is None:
         logger.info(f'Job {job.id} changed since it was read; not adopting it on this heartbeat')
-        return
+        return None
     # The claim is recorded before dispatch, so subsequent heartbeats see this job as
     # active and skip it, and the adoption task can check that it still owns the job.
-    adopt_job_async.apply_async(args=[job.id], kwargs={'owner_task_id': task_id}, uuid=task_id, queue=get_task_queuename())
+    _publish_adoption(job.id, task_id)
+    return task_id
 
 
 def _sweep_orphaned_jobs(this_inst):
@@ -1192,25 +1182,23 @@ def _sweep_orphaned_jobs(this_inst):
         .exclude(execution_node=F('controller_node'))
         .exclude(polymorphic_ctype_id=workflow_ctype_id)
         .order_by('started')  # longest-stranded first: they are closest to their deadline
-        .values_list('pk', 'controller_node')[: settings.HADR_ORPHAN_SWEEP_MAX_PER_HEARTBEAT]
+        .values_list('id', 'controller_node', 'celery_task_id', named=True)[: settings.HADR_ORPHAN_SWEEP_MAX_PER_HEARTBEAT]
     )
 
     swept = 0
-    for job_id, former_controller in list(orphans):
+    for orphan in list(orphans):
         try:
             if not _adoption_slot_available():
                 logger.info(f'Orphan sweep stopping at {swept} adoptions: out of control capacity, peer or next heartbeat takes the rest')
                 break
-            claimed = UnifiedJob.objects.filter(pk=job_id, controller_node=former_controller, status='running').update(controller_node=this_inst.hostname)
-            if not claimed:
+            if _dispatch_adoption(orphan, new_controller=this_inst.hostname) is None:
                 # Another node swept it between the query and here, or it just finished.
                 continue
-            _queue_job_adoption(job_id, this_inst.hostname)
             swept += 1
-            logger.warning(f'Orphan sweep adopting job {job_id}: controller {former_controller} is no longer a live instance')
+            logger.warning(f'Orphan sweep adopting job {orphan.id}: controller {orphan.controller_node} is no longer a live instance')
         except Exception:
             # One unadoptable job must not strand every job behind it in the list.
-            logger.exception(f'Orphan sweep failed to adopt job {job_id}')
+            logger.exception(f'Orphan sweep failed to adopt job {orphan.id}')
 
     if swept:
         logger.info(f'Orphan sweep queued {swept} adoption(s) for jobs whose controller is gone')
@@ -1416,7 +1404,7 @@ def _adoption_slot_available(headroom_needed=0):
     against the same number that bounds normally dispatched work. Operators tune it with the
     capacity_adjustment slider they already use.
 
-    The claim (_claim_job_for_adoption) runs before this check, so the job being considered
+    The claim (claim_for_adoption) runs before this check, so the job being considered
     is itself counted; remaining_capacity == 0 means it is the one that exactly fills us.
     That is the default, headroom_needed=0.
 
@@ -1443,74 +1431,41 @@ def _adoption_slot_available(headroom_needed=0):
     return me.remaining_capacity >= headroom_needed
 
 
-def _claim_job_for_adoption(job, job_id, source_controller):
-    """Claim a job for adoption, handling various ownership scenarios.
-
-    Returns True if the job is claimed (or already ours), False if we should skip.
-    """
-    if job.controller_node == settings.CLUSTER_HOST_ID:
-        logger.debug(f'adopt_job_async: job {job_id} already transitioned to current controller at queue time')
-        return True
-
-    if job.controller_node == source_controller:
-        updated_count = UnifiedJob.objects.filter(pk=job_id, controller_node=source_controller, status='running').update(
-            controller_node=settings.CLUSTER_HOST_ID
-        )
-        if updated_count == 0:
-            logger.info(f'Adoption skipped for job {job_id}: already claimed by another controller')
-            return False
-        return True
-
-    logger.info(f'Adoption skipped for job {job_id}: belongs to different controller {job.controller_node}')
-    return False
-
-
 @task(queue=get_task_queuename, on_duplicate='discard')
 @with_signal_handling
 def adopt_job_async(job_id, source_controller=None, owner_task_id=None):
     """Adopt a single orphaned job in a background task, streaming events in real-time.
 
-    Called from _process_startup_jobs, _process_running_jobs, and _reap_and_mark_lost_instance
-    via apply_async so the heartbeat returns immediately. on_duplicate='discard' ensures only
-    one adoption runs per job across heartbeat cycles.
+    Published by _dispatch_adoption and _handle_lost_instance_job after their claim, so the
+    heartbeat returns immediately. on_duplicate='discard' ensures only one adoption runs per
+    job across heartbeat cycles.
 
     Deliberately declared without a task timeout: it runs for as long as the job it is
     streaming, and a job's own timeout is what bounds that. It takes over signal handling for
     the same reason the job runner does — so a shutdown unwinds the stream in an orderly way
     instead of leaving the process-streamer thread blocked on a socket nobody will close.
 
-    Exactly one controller may run the adoption, so ownership is claimed either at queue time
-    (_reap_and_mark_lost_instance does it there, to keep the job visible to this controller
-    even if the lost instance is deprovisioned before the task runs) or atomically here. That
-    is why a job already moved to CLUSTER_HOST_ID is accepted alongside one still carrying
-    source_controller.
-
     Args:
         job_id: UnifiedJob primary key
-        source_controller: the controller_node value this job is expected to still carry.
-            Every in-tree caller passes its own hostname (== settings.CLUSTER_HOST_ID),
-            because _reap_and_mark_lost_instance claims ownership before publishing. It stays
-            a parameter so a caller that has *not* pre-claimed can pass the lost controller's
-            hostname and get the task-time atomic claim below instead. Defaults to this
-            controller so a message published by a pre-AAP-89602 controller during a rolling
-            upgrade (args=[job_id] only) still resolves, rather than failing with TypeError
-            and stranding the job.
+        source_controller: accepted and ignored. Earlier AAP-89602 builds published it; the
+            claim now happens before publishing, so the task only checks that this controller
+            owns the job.
         owner_task_id: the task id the job was claimed under. If a later claim replaced it,
-            this adoption does nothing.
+            this adoption does nothing. A message published by a pre-AAP-89602 controller
+            during a rolling upgrade carries args=[job_id] only and is checked by owner alone.
     """
-    adopt_job(job_id, open_work=lambda: ReceptorWork(get_receptor_ctl()), source_controller=source_controller, owner_task_id=owner_task_id)
+    adopt_job(job_id, open_work=lambda: ReceptorWork(get_receptor_ctl()), owner_task_id=owner_task_id)
 
 
-def adopt_job(job_id, open_work, clock=None, source_controller=None, owner_task_id=None):
-    """Adopt one orphaned job: claim it, then reattach to its work unit or time it out.
+def adopt_job(job_id, open_work, clock=None, owner_task_id=None):
+    """Adopt one orphaned job this controller has claimed: reattach to its work unit or time it out.
 
-    open_work returns the ReceptorWork to stream from; it is called once the job is claimed
-    and there is capacity for it. clock defaults to django.utils.timezone.now and is passed
-    to the reattach; the stall budgets still read the real clock.
+    open_work returns the ReceptorWork to stream from; it is called once ownership is
+    confirmed and there is capacity for the job. clock defaults to
+    django.utils.timezone.now and is passed to the reattach; the stall budgets still read
+    the real clock.
     """
     clock = clock or now
-    if source_controller is None:
-        source_controller = settings.CLUSTER_HOST_ID
 
     job = UnifiedJob.objects.filter(id=job_id, status='running').first()
     if not job:
@@ -1519,8 +1474,10 @@ def adopt_job(job_id, open_work, clock=None, source_controller=None, owner_task_
     if owner_task_id and job.celery_task_id != owner_task_id:
         logger.info(f'adopt_job_async: job {job_id} was claimed again by task {job.celery_task_id}, skipping')
         return
-
-    if not _claim_job_for_adoption(job, job_id, source_controller):
+    # Every claim sets controller_node to the claiming controller before publishing to its
+    # own queue, so a job owned by anyone else here was taken over since.
+    if job.controller_node != settings.CLUSTER_HOST_ID:
+        logger.info(f'Adoption skipped for job {job_id}: belongs to different controller {job.controller_node}')
         return
 
     # Checked after the claim, not before: the claim is what keeps the job visible to this

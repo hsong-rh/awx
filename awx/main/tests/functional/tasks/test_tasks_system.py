@@ -27,7 +27,7 @@ from awx.main.tasks.system import (
     _process_running_jobs,
     _sweep_orphaned_jobs,
     _handle_lost_instance_job,
-    _queue_job_adoption,
+    _dispatch_adoption,
     _adoption_slot_available,
     cluster_node_heartbeat,
     _startup_reap_undispatched,
@@ -519,13 +519,13 @@ class TestReapAndMarkLostInstance:
             mock_adopt.apply_async.return_value = (mock_result, None)
             _reap_and_mark_lost_instance(inst)
 
-        # Adoption should be queued, not reaped. Ownership has already moved to us by publish
-        # time, so source_controller is CLUSTER_HOST_ID, and the adoption is fenced by the
-        # task id recorded on the job.
+        # Adoption should be queued, not reaped. The claim moved the job to us and recorded the
+        # adoption's task id, which the adoption is fenced by.
         job.refresh_from_db()
+        assert job.controller_node == settings.CLUSTER_HOST_ID
         mock_adopt.apply_async.assert_called_once_with(
             args=[job.id],
-            kwargs={'source_controller': settings.CLUSTER_HOST_ID, 'owner_task_id': job.celery_task_id},
+            kwargs={'owner_task_id': job.celery_task_id},
             queue=mock_adopt.apply_async.call_args[1]['queue'],
             uuid=mock_adopt.apply_async.call_args[1]['uuid'],
         )
@@ -1133,7 +1133,7 @@ def test_adoption_finalizes_failed_job(me_inst):
 
 
 @pytest.mark.django_db
-def test_queue_job_adoption_records_the_task_id_before_publishing(me_inst):
+def test_dispatch_adoption_records_the_task_id_before_publishing(me_inst):
     """cancel-orphan: the adoption's task id must reach the job row before the task can run.
 
     UnifiedJob.cancel() addresses the dispatcher by (controller_node, celery_task_id). The
@@ -1154,7 +1154,7 @@ def test_queue_job_adoption_records_the_task_id_before_publishing(me_inst):
         return {'uuid': uuid or str(uuid4())}, None
 
     with patch('awx.main.tasks.system.adopt_job_async.apply_async', side_effect=_publish):
-        _queue_job_adoption(job.id, me_inst.hostname)
+        _dispatch_adoption(job)
 
     assert seen['uuid'], 'the adoption task id has to be chosen here, not handed back by the broker'
     assert seen['on_row_at_publish'] == seen['uuid'], 'a cancel racing the publish must already find the new task id'
@@ -2106,29 +2106,6 @@ def test_adopt_job_async_recognizes_queue_time_transfer(me_inst, settings):
     mock_reattach.assert_called_once()
 
 
-@pytest.mark.django_db
-def test_adopt_job_async_atomic_claim_on_task_time(me_inst, settings):
-    """adopt_job_async atomically claims job when still on source at task execution time."""
-    settings.HADR_JOB_ADOPTION_TIMEOUT = 3600
-    lost_controller = 'lost-host'
-    job = Job.objects.create(controller_node=lost_controller, status='running', work_unit_id='unit-atomic-claim')
-    # controller_node deliberately NOT changed: the task runs before any queue-time claim
-
-    mock_ctl = MagicMock()
-    mock_ctl.simple_command.return_value = {'StateName': 'Succeeded', 'ExitCode': 0}
-
-    with patch('awx.main.tasks.system.get_receptor_ctl', return_value=mock_ctl), patch('awx.main.tasks.system.reattach_to_work_unit') as mock_reattach:
-        # Adoption called with job still on lost_controller
-        adopt_job_async(job.id, source_controller=lost_controller)
-
-    # Verify job was atomically claimed
-    job.refresh_from_db()
-    assert job.controller_node == django_settings.CLUSTER_HOST_ID
-
-    # Verify adoption proceeded after claim
-    mock_reattach.assert_called_once()
-
-
 # ── _finalize_job_run coverage ──────────────────────────────────────────────
 
 
@@ -2431,18 +2408,18 @@ class TestOrphanSweep:
         `controller_node`, and the Instance row the lost-instance path keys on is gone."""
         job = self._orphan(controller_node='aap-controller-task-5d8697944-b4xlf')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
         assert job.controller_node == me_inst.hostname
-        queue.assert_called_once_with(job.id, me_inst.hostname)
+        queue.assert_called_once_with(job.id, Job.objects.get(pk=job.pk).celery_task_id)
 
     def test_job_owned_by_a_non_live_instance_is_adopted(self, me_inst):
         Instance.objects.create(hostname='offline-node', node_type='control', node_state=Instance.States.UNAVAILABLE)
         job = self._orphan(controller_node='offline-node')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
@@ -2455,7 +2432,7 @@ class TestOrphanSweep:
         Instance.objects.create(hostname='live-peer', node_type='control', node_state=Instance.States.READY)
         job = self._orphan(controller_node='live-peer')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
@@ -2467,7 +2444,7 @@ class TestOrphanSweep:
         belongs to the reaper, not here."""
         job = self._orphan(work_unit_id='')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
@@ -2484,7 +2461,7 @@ class TestOrphanSweep:
         back empty until the reaper cleaned up 20s later."""
         job = self._orphan(execution_node='dead-controller')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
@@ -2496,12 +2473,12 @@ class TestOrphanSweep:
         the controller, so the work unit is still there to reattach to."""
         job = self._orphan(execution_node='exec-node-1')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
         assert job.controller_node == me_inst.hostname
-        queue.assert_called_once_with(job.id, me_inst.hostname)
+        queue.assert_called_once_with(job.id, Job.objects.get(pk=job.pk).celery_task_id)
 
     def test_container_group_job_without_an_execution_node_is_still_adopted(self, me_inst):
         """A container group job carries no execution_node — its pod runs in Kubernetes and
@@ -2509,18 +2486,18 @@ class TestOrphanSweep:
         execution_node to controller_node, which an empty value never matches."""
         job = self._orphan(execution_node='')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
         assert job.controller_node == me_inst.hostname
-        queue.assert_called_once_with(job.id, me_inst.hostname)
+        queue.assert_called_once_with(job.id, Job.objects.get(pk=job.pk).celery_task_id)
 
     def test_workflow_jobs_are_excluded(self, me_inst):
         """A workflow job has no work unit of its own; its nodes are separate jobs."""
         wfj = WorkflowJob.objects.create(controller_node='dead-controller', status='running', work_unit_id='unit-wf')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         wfj.refresh_from_db()
@@ -2533,7 +2510,7 @@ class TestOrphanSweep:
         running, and sweeping then would steal live work."""
         job = self._orphan(controller_node='')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
@@ -2543,7 +2520,7 @@ class TestOrphanSweep:
     def test_non_running_jobs_are_left_alone(self, me_inst):
         self._orphan(status='pending')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         queue.assert_not_called()
@@ -2555,7 +2532,7 @@ class TestOrphanSweep:
 
         with (
             patch('awx.main.tasks.system._adoption_slot_available', side_effect=[True, True, False, False]),
-            patch('awx.main.tasks.system._queue_job_adoption') as queue,
+            patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _sweep_orphaned_jobs(me_inst)
 
@@ -2573,11 +2550,11 @@ class TestOrphanSweep:
 
         with (
             patch('awx.main.tasks.system._adoption_slot_available', side_effect=[True, False]),
-            patch('awx.main.tasks.system._queue_job_adoption') as queue,
+            patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _sweep_orphaned_jobs(me_inst)
 
-        queue.assert_called_once_with(oldest.id, me_inst.hostname)
+        queue.assert_called_once_with(oldest.id, Job.objects.get(pk=oldest.pk).celery_task_id)
         assert Job.objects.get(pk=newest.pk).controller_node == 'dead-controller'
 
     def test_a_lost_claim_race_does_not_publish_an_adoption(self, me_inst):
@@ -2591,7 +2568,7 @@ class TestOrphanSweep:
             return True
 
         with (
-            patch('awx.main.tasks.system._queue_job_adoption') as queue,
+            patch('awx.main.tasks.system._publish_adoption') as queue,
             patch('awx.main.tasks.system._adoption_slot_available', side_effect=peer_wins_the_claim),
         ):
             _sweep_orphaned_jobs(me_inst)
@@ -2606,7 +2583,7 @@ class TestOrphanSweep:
         for i in range(5):
             self._orphan(work_unit_id=f'unit-cap-{i}')
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         assert queue.call_count == 2
@@ -2616,7 +2593,7 @@ class TestOrphanSweep:
         self._orphan(work_unit_id='unit-a', started=now() - timedelta(seconds=9000))
         self._orphan(work_unit_id='unit-b', started=now() - timedelta(seconds=600))
 
-        with patch('awx.main.tasks.system._queue_job_adoption', side_effect=[RuntimeError('boom'), None]) as queue:
+        with patch('awx.main.tasks.system._publish_adoption', side_effect=[RuntimeError('boom'), None]) as queue:
             _sweep_orphaned_jobs(me_inst)
 
         assert queue.call_count == 2
@@ -2639,7 +2616,7 @@ class TestOrphanSweep:
         )
         job = self._orphan(controller_node=sick_but_alive.hostname)
 
-        with patch('awx.main.tasks.system._queue_job_adoption') as queue:
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
             _sweep_orphaned_jobs(me_inst)
 
         job.refresh_from_db()
@@ -2698,7 +2675,7 @@ class TestLostInstanceCapacity:
 
         with (
             patch('awx.main.tasks.system._adoption_slot_available', return_value=False),
-            patch('awx.main.tasks.system._queue_job_adoption') as queue,
+            patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _handle_lost_instance_job(job, lost)
 
@@ -2721,7 +2698,7 @@ class TestLostInstanceCapacity:
 
         with (
             patch('awx.main.tasks.system._adoption_slot_available', side_effect=record),
-            patch('awx.main.tasks.system._queue_job_adoption'),
+            patch('awx.main.tasks.system._publish_adoption'),
         ):
             _handle_lost_instance_job(job, lost)
 
@@ -2750,13 +2727,13 @@ class TestLostInstanceCapacity:
 
         with (
             patch('awx.main.tasks.system._adoption_slot_available', return_value=True),
-            patch('awx.main.tasks.system._queue_job_adoption') as queue,
+            patch('awx.main.tasks.system._publish_adoption') as queue,
         ):
             _handle_lost_instance_job(job, lost)
 
         job.refresh_from_db()
         assert job.controller_node == me_inst.hostname
-        queue.assert_called_once_with(job.id, me_inst.hostname)
+        queue.assert_called_once_with(job.id, Job.objects.get(pk=job.pk).celery_task_id)
 
     def test_headroom_is_requested_for_a_job_not_yet_claimed(self, me_inst, settings):
         """_adoption_slot_available answers the post-claim question by default ("does the job I
@@ -2768,7 +2745,7 @@ class TestLostInstanceCapacity:
 
         with (
             patch('awx.main.tasks.system._adoption_slot_available', return_value=True) as slot,
-            patch('awx.main.tasks.system._queue_job_adoption'),
+            patch('awx.main.tasks.system._publish_adoption'),
         ):
             _handle_lost_instance_job(job, lost)
 

@@ -120,6 +120,74 @@ def test_heartbeat_claims_before_dispatching_under_the_claimed_id(running_job, m
     assert kwargs['kwargs'] == {'owner_task_id': running_job.celery_task_id}
 
 
+# ── Taking a job from another controller ──────────────────────────────────────
+
+LOST = 'ctrl-lost'
+PEER = 'ctrl-peer'
+
+
+@pytest.fixture
+def orphaned_job(me_inst):
+    return Job.objects.create(controller_node=LOST, execution_node='receptor-1', status='running', work_unit_id=UNIT, celery_task_id=ORIGINAL)
+
+
+@pytest.mark.django_db
+def test_claim_from_another_controller_moves_the_job_and_its_task_id_together(orphaned_job, me_inst):
+    task_id = claim_for_adoption(orphaned_job, new_controller=me_inst.hostname)
+
+    assert task_id is not None
+    orphaned_job.refresh_from_db()
+    assert (orphaned_job.controller_node, orphaned_job.celery_task_id) == (me_inst.hostname, task_id)
+
+
+@pytest.mark.django_db
+def test_claim_from_another_controller_loses_to_a_peer_that_claimed_first(orphaned_job, me_inst):
+    # 3.1 Claim race: both controllers read the orphan, the peer claims first.
+    our_read = Job.objects.get(pk=orphaned_job.pk)
+    assert claim_for_adoption(Job.objects.get(pk=orphaned_job.pk), new_controller=PEER) is not None
+
+    assert claim_for_adoption(our_read, new_controller=me_inst.hostname) is None
+    orphaned_job.refresh_from_db()
+    assert orphaned_job.controller_node == PEER
+
+
+@pytest.mark.django_db
+def test_claim_fails_when_only_the_controller_changed_since_the_read(orphaned_job, me_inst):
+    our_read = Job.objects.get(pk=orphaned_job.pk)
+    Job.objects.filter(pk=orphaned_job.pk).update(controller_node=PEER)
+
+    assert claim_for_adoption(our_read, new_controller=me_inst.hostname) is None
+
+
+@pytest.mark.django_db
+def test_dispatch_from_another_controller_records_both_fields_before_publishing(orphaned_job, me_inst):
+    # AAP-96797: a cancel addresses (controller_node, celery_task_id). Both must already name
+    # the adoption when the message goes out, or a cancel in that window reaches nobody.
+    seen = {}
+
+    def publish(args=None, kwargs=None, queue=None, uuid=None):
+        row = Job.objects.get(pk=orphaned_job.pk)
+        seen.update(row=(row.controller_node, row.celery_task_id), uuid=uuid, kwargs=kwargs)
+
+    with mock.patch('awx.main.tasks.system.adopt_job_async.apply_async', side_effect=publish):
+        task_id = _dispatch_adoption(orphaned_job, new_controller=me_inst.hostname)
+
+    assert task_id == seen['uuid']
+    assert seen['row'] == (me_inst.hostname, task_id)
+    assert seen['kwargs'] == {'owner_task_id': task_id}
+
+
+@pytest.mark.django_db
+def test_adoption_of_a_job_another_controller_owns_does_nothing(orphaned_job):
+    opened = mock.Mock()
+
+    adopt_job(orphaned_job.id, open_work=opened)
+
+    opened.assert_not_called()
+    orphaned_job.refresh_from_db()
+    assert (orphaned_job.controller_node, orphaned_job.status) == (LOST, 'running')
+
+
 # ── Stale writers after a claim ───────────────────────────────────────────────
 
 
