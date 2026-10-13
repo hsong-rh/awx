@@ -11,6 +11,7 @@ from awx.main.tasks.adoption_decisions import (
     adoption_deadline_passed,
     adoption_slot_available,
     find_lost_instances,
+    live_controller_hostnames,
     gate_lost_instances,
     lost_instance_disposition,
     lost_instance_job_action,
@@ -187,6 +188,32 @@ class TestAdoptionSlotAvailable:
     def test_unsized_or_draining_controller_does_not_block_adoption(self):
         # Zero capacity means not yet sized by the capacity job, or draining. Neither is "no room".
         assert adoption_slot_available(capacity=0, remaining_capacity=-5, headroom_needed=self.IMPACT) is True
+
+
+class TestLiveControllerHostnames:
+    GRACE = 120
+
+    def live(self, *instances):
+        return live_controller_hostnames(instances, NOW, self.GRACE)
+
+    @pytest.mark.parametrize('node_state', ['ready', 'installed'])
+    def test_ready_or_installed_instance_is_live(self, node_state):
+        assert self.live(make_instance(PEER, node_state=node_state, seconds_since_seen=10_000)) == {PEER}
+
+    def test_instance_unavailable_after_a_recent_check_in_is_still_live(self):
+        # AAP-96708: one failed Redis ping marks a running controller unavailable. Sweeping its
+        # jobs then ran them three times over.
+        assert self.live(make_instance(PEER, node_state='unavailable', seconds_since_seen=self.GRACE)) == {PEER}
+
+    def test_instance_unavailable_past_the_grace_period_is_not_live(self):
+        assert self.live(make_instance(PEER, node_state='unavailable', seconds_since_seen=self.GRACE + 1)) == set()
+
+    def test_unavailable_instance_never_seen_is_not_live(self):
+        assert self.live(make_instance(PEER, node_state='unavailable', seconds_since_seen=None)) == set()
+
+    @pytest.mark.parametrize('node_state', ['provisioning', 'deprovisioning', 'provision-fail', 'deprovision-fail'])
+    def test_instance_in_any_other_state_is_not_live(self, node_state):
+        assert self.live(make_instance(PEER, node_state=node_state)) == set()
 
 
 class TestStartupJobAction:

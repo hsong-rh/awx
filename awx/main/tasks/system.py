@@ -78,6 +78,7 @@ from awx.main.tasks.adoption_decisions import (
     adoption_slot_available,
     find_lost_instances,
     gate_lost_instances,
+    live_controller_hostnames,
     lost_instance_disposition,
     lost_instance_job_action,
     running_job_action,
@@ -1075,7 +1076,7 @@ def _process_running_jobs(this_inst, active_task_ids, ref_time):
     if not jobs:
         return
 
-    live_controller_hostnames = set(
+    live_controllers = set(
         Instance.objects.filter(
             node_state__in=(Instance.States.READY, Instance.States.INSTALLED),
         ).values_list('hostname', flat=True)
@@ -1083,7 +1084,7 @@ def _process_running_jobs(this_inst, active_task_ids, ref_time):
 
     for j in jobs:
         try:
-            action = running_job_action(j, this_inst.hostname, active_task_ids, ref_time, workflow_ctype_id, live_controller_hostnames)
+            action = running_job_action(j, this_inst.hostname, active_task_ids, ref_time, workflow_ctype_id, live_controllers)
             if action == JobAction.ADOPT:
                 _dispatch_adoption(j)
             elif action == JobAction.REAP:
@@ -1152,10 +1153,8 @@ def _sweep_orphaned_jobs(this_inst):
     hold and leaves the rest owned by the dead controller, where the peer's own sweep will
     find them.
     """
-    grace_cutoff = now() - timedelta(seconds=settings.CLUSTER_NODE_HEARTBEAT_PERIOD * settings.CLUSTER_NODE_MISSED_HEARTBEAT_TOLERANCE)
-    live_hostnames = Instance.objects.filter(
-        Q(node_state__in=(Instance.States.READY, Instance.States.INSTALLED)) | Q(node_state=Instance.States.UNAVAILABLE, last_seen__gte=grace_cutoff)
-    ).values_list('hostname', flat=True)
+    grace_seconds = settings.CLUSTER_NODE_HEARTBEAT_PERIOD * settings.CLUSTER_NODE_MISSED_HEARTBEAT_TOLERANCE
+    live_hostnames = live_controller_hostnames(Instance.objects.only('hostname', 'node_state', 'last_seen'), now(), grace_seconds)
 
     workflow_ctype_id = ContentType.objects.get_for_model(WorkflowJob).id
     orphans = (

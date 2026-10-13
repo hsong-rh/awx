@@ -40,6 +40,23 @@ def find_lost_instances(instance_list, this_hostname, ref_time):
     return lost, remaining
 
 
+def live_controller_hostnames(instances, ref_time, grace_seconds):
+    """Hostnames of the instances the orphan sweep must not take jobs from.
+
+    An instance is live while it is ready or installed. It also stays live while unavailable
+    if it checked in within grace_seconds of ref_time: one failed Redis ping marks a running
+    controller unavailable with a recent last_seen, and sweeping its jobs then had the
+    controller and its peers all stream them (AAP-96708). A controller that leaves on purpose
+    back-dates its last_seen past the grace period, so its jobs are swept at once.
+    """
+    cutoff = ref_time - timedelta(seconds=grace_seconds)
+    return {
+        inst.hostname
+        for inst in instances
+        if inst.node_state in ('ready', 'installed') or (inst.node_state == 'unavailable' and inst.last_seen is not None and inst.last_seen >= cutoff)
+    }
+
+
 def gate_lost_instances(lost_instances, mesh_ready):
     """Return the lost instances that may be handled now.
 
