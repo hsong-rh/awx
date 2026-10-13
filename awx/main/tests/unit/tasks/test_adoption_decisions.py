@@ -148,8 +148,8 @@ class TestStartupJobAction:
 
 
 class TestRunningJobAction:
-    def decide(self, job, active_task_ids=('other-task',), ref_time=NOW):
-        return running_job_action(job, ME, list(active_task_ids), ref_time, WORKFLOW_CTYPE)
+    def decide(self, job, active_task_ids=('other-task',), ref_time=NOW, live_controllers=(ME,)):
+        return running_job_action(job, ME, list(active_task_ids), ref_time, WORKFLOW_CTYPE, live_controllers)
 
     def test_orphan_this_instance_controls_is_adopted(self):
         assert self.decide(make_job()) == JobAction.ADOPT
@@ -160,9 +160,17 @@ class TestRunningJobAction:
     def test_orphan_not_yet_dispatched_to_receptor_is_reaped(self):
         assert self.decide(make_job(work_unit_id='')) == JobAction.REAP
 
-    def test_orphan_this_instance_only_executes_is_reaped(self):
-        # A hybrid node running a job for another controller: it can't adopt, so it reaps.
-        assert self.decide(make_job(controller_node=PEER, execution_node=ME)) == JobAction.REAP
+    def test_orphan_this_instance_only_executes_is_left_to_the_sweep(self):
+        # A dispatched job this instance only executes, for a controller that isn't live: this
+        # instance can't adopt it, and the orphan sweep will.
+        assert self.decide(make_job(controller_node=PEER, execution_node=ME)) == JobAction.SKIP
+
+    def test_orphan_this_instance_only_executes_for_a_live_controller_is_left_to_it(self):
+        assert self.decide(make_job(controller_node=PEER, execution_node=ME, work_unit_id=''), live_controllers=(ME, PEER)) == JobAction.SKIP
+
+    def test_undispatched_orphan_this_instance_only_executes_is_reaped(self):
+        # Nothing to adopt and no live controller to hand it back to.
+        assert self.decide(make_job(controller_node=PEER, execution_node=ME, work_unit_id='')) == JobAction.REAP
 
     def test_job_of_another_instance_is_left_alone(self):
         assert self.decide(make_job(controller_node=PEER)) == JobAction.SKIP
