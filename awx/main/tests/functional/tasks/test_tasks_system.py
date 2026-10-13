@@ -2341,7 +2341,7 @@ class TestContainerGroupAdoptionRouting:
         patcher = patch.object(type(job), 'is_container_group_task', property(lambda self: is_container_group))
         return job, patcher
 
-    def _adopt(self, job, me_inst, patcher):
+    def _adopt(self, job, me_inst, patcher, owner_task_id=None):
         with (
             patcher,
             patch('awx.main.tasks.system._adoption_slot_available', return_value=True),
@@ -2351,8 +2351,16 @@ class TestContainerGroupAdoptionRouting:
             patch('awx.main.tasks.system.reattach_to_work_unit') as mock_mesh,
             patch('awx.main.tasks.system.reaper') as mock_reaper,
         ):
-            adopt_job_async(job.id, source_controller=me_inst.hostname)
+            adopt_job_async(job.id, source_controller=me_inst.hostname, owner_task_id=owner_task_id)
             return mock_cg, mock_mesh, mock_reaper
+
+    def test_the_adoption_owner_reaches_the_kubernetes_path(self, me_inst):
+        """The Kubernetes path finalizes the job too, so it must be fenced by the same owner."""
+        job, patcher = self._job(me_inst, is_container_group=True)
+        Job.objects.filter(pk=job.pk).update(celery_task_id='adoption-task')
+        mock_cg, _mock_mesh, _mock_reaper = self._adopt(job, me_inst, patcher, owner_task_id='adoption-task')
+
+        assert mock_cg.call_args.kwargs['owner_task_id'] == 'adoption-task'
 
     def test_unreachable_container_group_job_goes_to_the_kubernetes_path(self, me_inst):
         job, patcher = self._job(me_inst, is_container_group=True)

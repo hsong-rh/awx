@@ -214,8 +214,9 @@ def _finalize_job_run(model, pk, runner_callback, status, extra_fields=None, own
     taken the job over (adoption records its own task id in celery_task_id).
 
     _required_status: when set, the write is skipped and None is returned if the row's
-    current status does not match. Passed by the adoption path to prevent a second
-    controller from overwriting a terminal status already committed by the first.
+    current status does not match. Both final status paths, BaseTask.run() and adoption,
+    pass 'running', so a job that something else already ended, such as a reap, keeps that
+    one terminal status and sends no second notification.
     """
     all_fields = runner_callback.get_delayed_update_fields()
     if extra_fields:
@@ -660,9 +661,10 @@ class BaseTask(object):
         """
         release_work = True
         try:
-            # _required_status='running' is a CAS fence from #16669: if another controller already
-            # finalized this job, the write is skipped and self.instance becomes None, preventing
-            # double-finalization and a duplicate terminal notification.
+            # owner_task_id refuses the write if an adoption claimed the job (NotOwner below).
+            # _required_status='running' skips it if something that took no ownership, such as a
+            # reap, already ended the job; self.instance is then None, and run() stops without a
+            # second terminal notification.
             self.instance = _finalize_job_run(self.model, pk, self.runner_callback, status, owner_task_id=owner_task_id, _required_status='running')
         except NotOwner as exc:
             logger.warning(f'{self.instance.log_format} was taken over by task {exc.current_task_id}; not writing status {status} or releasing its work unit')

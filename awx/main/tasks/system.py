@@ -1539,7 +1539,7 @@ def adopt_job(job_id, open_work, clock=None, owner_task_id=None):
                 from awx.main.tasks.container_groups import adopt_container_group_job
 
                 try:
-                    adopt_container_group_job(job, receptor_ctl=work.receptor_ctl)
+                    adopt_container_group_job(job, receptor_ctl=work.receptor_ctl, owner_task_id=owner_task_id)
                 except Exception:
                     logger.exception(f'adopt_job_async: container-group adoption failed for job {job.id}')
                 return

@@ -23,8 +23,14 @@ def _write_fields(model, pk, select_for_update, owner_task_id, updates, required
     """Load the row, check ownership and status, and save the given fields in one transaction.
 
     Both checks run inside the select_for_update transaction, so check and write are atomic.
-    required_status: when set, nothing is written and None is returned if the row's current
-    status differs. This is the double-finalization fence from #16669.
+    They guard different things, and a final status write needs both:
+
+    owner_task_id decides who may write. A claim for adoption replaces celery_task_id, so the
+    task that owned the job before is refused with NotOwner.
+
+    required_status makes the write happen once. When set, nothing is written and None is
+    returned if the row's current status differs. A reap ends a job without taking ownership,
+    so only this check stops the owner from writing a second terminal status over it.
     """
     with transaction.atomic():
         # Retrieve the model instance.

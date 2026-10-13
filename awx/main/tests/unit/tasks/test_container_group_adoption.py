@@ -26,6 +26,7 @@ from awx.main.tasks.container_groups import (
     pod_has_output,
     requeue_wedged_job,
 )
+from awx.main.utils.update_model import NotOwner
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +469,17 @@ def test_output_probe_failure_defers_instead_of_classifying_as_wedged(adoption_e
     adoption_env['delete_job_pod'].assert_not_called()
 
 
+def test_the_adoption_owner_reaches_both_recovery_paths(adoption_env):
+    """Harvesting and attaching both finalize the job, so both are fenced by the owner."""
+    adoption_env['classify_job_pod'].return_value = PodState.TERMINAL
+    adopt_container_group_job(_job(), owner_task_id='adoption-task')
+    assert adoption_env['harvest_terminal_pod'].call_args.kwargs['owner_task_id'] == 'adoption-task'
+
+    adoption_env['classify_job_pod'].return_value = PodState.STREAMING
+    adopt_container_group_job(_job(), owner_task_id='adoption-task')
+    assert adoption_env['attach_to_streaming_pod'].call_args.kwargs['owner_task_id'] == 'adoption-task'
+
+
 def test_output_probe_is_skipped_for_a_terminal_pod(adoption_env):
     """A finished pod is harvested regardless, so do not spend an API call asking."""
     adoption_env['find_job_pod'].return_value = _pod(phase='Succeeded', exit_code=0)
@@ -528,6 +540,15 @@ def test_attach_hands_off_to_the_ordinary_adoption_path(attach_env):
     assert reattach_job is job
     assert reattach_work.receptor_ctl is ctl
     assert attach_env['reattach_to_work_unit'].call_args.kwargs['unit_status'] == {'StateName': 'Running', 'ExtraData': {'PodName': 'automation-job-42-abcde'}}
+
+
+def test_attach_streams_as_the_owner_it_was_given(attach_env):
+    ctl = _receptor_ctl()
+    ctl.simple_command.return_value = {'StateName': 'Running', 'ExtraData': {'PodName': 'automation-job-42-abcde'}}
+
+    attach_to_streaming_pod(_job(), 'automation-job-42-abcde', _pod(), receptor_ctl=ctl, owner_task_id='adoption-task')
+
+    assert attach_env['reattach_to_work_unit'].call_args.kwargs['owner_task_id'] == 'adoption-task'
 
 
 def test_attach_defers_when_the_submit_fails_and_leaves_the_job_alone(attach_env):
@@ -702,3 +723,21 @@ def test_harvest_carries_persisted_event_count_into_the_callback(harvest_env):
     harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
 
     assert harvest_env['callback'].event_ct == 9
+
+
+def test_harvest_finalizes_as_the_owner_it_was_given(harvest_env):
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+
+    harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0), owner_task_id='adoption-task')
+
+    assert harvest_env['_finalize_adopted_job'].call_args.kwargs['owner_task_id'] == 'adoption-task'
+
+
+def test_harvest_by_a_task_that_lost_the_job_writes_nothing_and_is_done(harvest_env, tmp_path):
+    """A later claim took the job over, so its final status belongs to that task. This task
+    has nothing left to do, and must not raise into the adoption that called it."""
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+    harvest_env['_finalize_adopted_job'].side_effect = NotOwner(42, 'adoption-task', 'newer-task')
+
+    assert harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0), owner_task_id='adoption-task') is True
+    assert not tmp_path.exists(), 'private_data_dir leaked'
