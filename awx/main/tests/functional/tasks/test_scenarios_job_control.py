@@ -6,8 +6,9 @@ have. The others guard behavior devel already gets right.
 Several devel bugs share one cause: when a lost controller's job is marked failed, its
 playbook keeps running on the execution node. Whatever depends on the job being active
 (launch blocking, relaunch, instance group limits, execution node capacity, workflow
-branching) then sees a finished job. test_reaped_job_does_not_leave_its_playbook_running
-covers each of those bugs with the job shape its scenario used.
+branching) then sees a finished job. test_lost_controllers_job_does_not_leave_its_playbook_running
+covers each of those bugs with the job shape its scenario used; adoption fixes them by
+keeping the job active.
 """
 
 import pytest
@@ -17,6 +18,7 @@ from awx.main.tasks.system import adopt_job
 from awx.main.tests.adoption_cluster import (
     EXEC,
     PEER,
+    THIS,
     UNIT,
     adoption_env,
     assert_playbook_not_left_running,
@@ -45,15 +47,20 @@ def running_unit():
     return FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10), state='Running')})
 
 
+def adopt_claimed(jobs, work):
+    """Run the adoptions lost-instance handling queued for ctrl-0, as its dispatcher would."""
+    for job in Job.objects.filter(pk__in=[j.pk for j in jobs], controller_node=THIS):
+        adopt_job(job.id, open_work=lambda: work, owner_task_id=job.celery_task_id)
+
+
 # ── Canceling an orphaned job ─────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason='AAP-96830: canceling a job whose controller is down is dropped; the job never ends canceled')
 @pytest.mark.django_db
 def test_cancel_requested_while_orphaned_cancels_the_unit(me_inst):
-    # 4.1 Cancel while orphaned. The user canceled while the controller was down, so the
-    # cancel reached no one. Today adoption never reads cancel_flag: it waits for the unit
-    # and finishes the job, successful, with cancel_flag set.
+    # 4.1 Cancel while orphaned (AAP-96830). The user canceled while the controller was
+    # down, so the cancel reached no one. Adoption reads cancel_flag, cancels the unit and
+    # ends the job canceled.
     job = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id=UNIT, cancel_flag=True)
     work = running_unit()
 
@@ -78,30 +85,33 @@ def test_canceled_job_whose_unit_is_gone_is_finalized_canceled(me_inst):
     assert job.status == 'canceled'
 
 
-@pytest.mark.xfail(strict=True, reason='AAP-96836: canceling many orphaned jobs marks them failed one by one instead of canceled')
 @pytest.mark.django_db
 def test_canceled_orphans_of_a_lost_controller_end_canceled():
-    # 4.15 Canceling many orphans at once. Twenty jobs of a dead controller were canceled
-    # while it was down. Today they are marked failed, "Job reaped due to instance shutdown".
+    # 4.15 Canceling many orphans at once (AAP-96836). Twenty jobs of a dead controller were canceled
+    # while it was down. On devel they are marked failed, "Job reaped due to instance
+    # shutdown". A controller that adopts them carries out the cancel when it adopts.
     make_cluster()
     canceled = [peer_job(work_unit_id=f'unit-{n}', cancel_flag=True) for n in range(20)]
+    work = FakeReceptorWork({job.work_unit_id: FakeWorkUnit(make_events(10), state='Running') for job in canceled})
 
     run_lost_instance_handling(mesh(EXEC))
+    adopt_claimed(canceled, work)
 
     statuses = {job.status for job in Job.objects.filter(pk__in=[j.pk for j in canceled])}
     assert statuses == {'canceled'}
 
 
-@pytest.mark.xfail(strict=True, reason='AAP-96840: canceling a sliced job leaves the orphaned slice failed with its playbook running')
 @pytest.mark.django_db
 def test_canceled_slice_of_a_lost_controller_ends_canceled_and_stops():
-    # 4.21 Canceling a sliced job. The parent was canceled, so the orphaned slice has
-    # cancel_flag set. Today it ends failed and its playbook runs to the end.
+    # 4.21 Canceling a sliced job (AAP-96840). The parent was canceled, so the orphaned
+    # slice has cancel_flag set. On devel it ends failed and its playbook runs to the end;
+    # the controller that adopts it cancels the unit and ends it canceled.
     make_cluster()
     job = peer_job(job_slice_number=1, job_slice_count=2, cancel_flag=True)
     work = running_unit()
 
     run_lost_instance_handling(mesh(EXEC), work=work)
+    adopt_claimed([job], work)
 
     job.refresh_from_db()
     assert job.status == 'canceled'
@@ -126,30 +136,26 @@ def job_in_limited_instance_group():
     return peer_job(instance_group=InstanceGroup.objects.create(name='limited', max_concurrent_jobs=2))
 
 
-def xfail(bug):
-    return pytest.mark.xfail(strict=True, reason=f'{bug}: a reaped job leaves its playbook running')
-
-
 @pytest.mark.parametrize(
     'make_job',
     [
-        pytest.param(job_of_template_without_simultaneous_runs, id='AAP-96832-same-hosts', marks=xfail('AAP-96832')),
-        pytest.param(job_in_workflow, id='AAP-96833-nested-workflow', marks=xfail('AAP-96833')),
-        pytest.param(job_of_template_without_simultaneous_runs, id='AAP-96834-relaunch', marks=xfail('AAP-96834')),
-        pytest.param(job_in_limited_instance_group, id='AAP-96837-instance-group-limit', marks=xfail('AAP-96837')),
-        pytest.param(peer_job, id='AAP-96841-execution-node-capacity', marks=xfail('AAP-96841')),
-        pytest.param(job_in_workflow, id='AAP-96844-workflow-branch', marks=xfail('AAP-96844')),
-        pytest.param(job_in_workflow, id='AAP-96845-set-stats-artifacts', marks=xfail('AAP-96845')),
+        pytest.param(job_of_template_without_simultaneous_runs, id='AAP-96832-same-hosts'),
+        pytest.param(job_in_workflow, id='AAP-96833-nested-workflow'),
+        pytest.param(job_of_template_without_simultaneous_runs, id='AAP-96834-relaunch'),
+        pytest.param(job_in_limited_instance_group, id='AAP-96837-instance-group-limit'),
+        pytest.param(peer_job, id='AAP-96841-execution-node-capacity'),
+        pytest.param(job_in_workflow, id='AAP-96844-workflow-branch'),
+        pytest.param(job_in_workflow, id='AAP-96845-set-stats-artifacts'),
     ],
 )
 @pytest.mark.django_db
-def test_reaped_job_does_not_leave_its_playbook_running(make_job):
-    # ctrl-1 is lost while its job runs on receptor-1, which is still up. Today the job is
-    # marked failed and nothing cancels its work unit, so the playbook runs on unobserved:
-    # the next launch overlaps it (4.6, 4.12), it stops counting toward instance group and
-    # execution node limits (4.17, 4.23), and a workflow takes the failure branch for a
-    # playbook that succeeds (4.11, 5.5, 5.6). Either the unit is canceled when the job is
-    # marked failed, or the job stays active until the unit ends.
+def test_lost_controllers_job_does_not_leave_its_playbook_running(make_job):
+    # ctrl-1 is lost while its job runs on receptor-1, which is still up. On devel the job
+    # is marked failed and nothing cancels its work unit, so the playbook runs on
+    # unobserved: the next launch overlaps it (4.6, 4.12), it stops counting toward
+    # instance group and execution node limits (4.17, 4.23), and a workflow takes the
+    # failure branch for a playbook that succeeds (4.11, 5.5, 5.6). ctrl-0 claims the job
+    # instead, so it stays active and its adoption streams the unit to the end.
     make_cluster()
     job = make_job()
     work = running_unit()
@@ -157,6 +163,7 @@ def test_reaped_job_does_not_leave_its_playbook_running(make_job):
     run_lost_instance_handling(mesh(EXEC), work=work)
 
     assert_playbook_not_left_running(job, work)
+    assert job.controller_node == THIS
 
 
 # ── Waiting jobs of a lost controller ─────────────────────────────────────────

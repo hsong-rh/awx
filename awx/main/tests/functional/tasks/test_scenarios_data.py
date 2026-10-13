@@ -103,9 +103,11 @@ def test_replayed_events_keep_the_host_ids_the_job_started_with(me_inst, invento
 @pytest.mark.django_db
 def test_reap_is_recorded_in_the_activity_stream():
     # 5.16 Activity stream. Nothing records that a lost controller's job was marked
-    # failed, so an auditor cannot tell a reaped job from one whose playbook failed.
+    # failed, so an auditor cannot tell a reaped job from one whose playbook failed. A
+    # job that ran on its controller is still reaped when that hybrid node is lost: its
+    # playbook went down with it, so there is nothing to adopt.
     make_cluster()
-    job = Job.objects.create(controller_node=PEER, execution_node=EXEC, status='running', work_unit_id=UNIT)
+    job = Job.objects.create(controller_node=PEER, execution_node=PEER, status='running', work_unit_id=UNIT)
     entries_before = ActivityStream.objects.filter(job=job).count()
 
     run_lost_instance_handling(mesh(EXEC))

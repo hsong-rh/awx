@@ -12,8 +12,9 @@ from django.utils.timezone import now, timedelta
 
 from awx.main.models import Job, JobEvent
 from awx.main.tasks import jobs
+from awx.main.tasks.receptor import AWXReceptorJob
 from awx.main.tasks.system import adopt_job
-from awx.main.tests.adoption_cluster import UNIT, adoption_env
+from awx.main.tests.adoption_cluster import UNIT, adoption_env, save_dispatched_events
 from awx.main.tests.fake_clock import FakeClock
 from awx.main.tests.fake_receptor import FakeReceptorWork, FakeWorkUnit, RecordingDispatcher, make_events
 
@@ -64,13 +65,12 @@ def test_finalize_error_is_retried_on_the_next_adoption(orphan):
     assert orphan.status == 'successful'
 
 
-@pytest.mark.xfail(strict=True, reason='AAP-96829: a restart fails a healthy job with a long quiet task while its playbook keeps running')
 @pytest.mark.django_db
 def test_quiet_job_whose_unit_is_still_running_is_not_failed(orphan):
-    # 3.6 Quiet deadline. The playbook is in a long task with no output, so its last event
-    # is older than HADR_JOB_ADOPTION_TIMEOUT, but receptor reports the unit running.
-    # Today adoption measures the deadline from the last event and fails the job, while
-    # the playbook keeps running on the execution node.
+    # 3.6 Quiet deadline (AAP-96829). The playbook is in a long task with no output, so its
+    # last event is older than HADR_JOB_ADOPTION_TIMEOUT, but receptor reports the unit
+    # running. Devel measures the deadline from the last event and fails the job while the
+    # playbook keeps running. A reachable unit is never timed out: it is streamed live.
     clock = FakeClock()
     save_events(orphan, range(1, 6), created=clock() - timedelta(seconds=TIMEOUT + 60))
     work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10), state='Running')})
@@ -78,31 +78,50 @@ def test_quiet_job_whose_unit_is_still_running_is_not_failed(orphan):
     adopt_job(orphan.id, open_work=lambda: work, clock=clock)
 
     orphan.refresh_from_db()
-    assert orphan.status == 'running'
+    assert orphan.status == 'successful'
+    assert ('cancel', UNIT) not in work.calls
+    assert RecordingDispatcher.counters() == list(range(6, 11))
 
 
 @pytest.mark.django_db
-def test_adoption_waits_through_repeated_restarts_and_replays_each_event_once(orphan):
-    # 3.7 Three restarts during one job. While the unit runs, each adoption defers; once
-    # it finishes, the replay sends only the events not yet saved, each once.
+def test_adoption_survives_repeated_restarts_and_replays_each_event_once(orphan):
+    # 3.7 Three restarts during one job. Each adoption streams the running unit until its
+    # controller shuts down and detaches; the next replays only the events not yet saved.
+    # Once the unit finishes, the job is finalized, and every event was sent exactly once.
     clock = FakeClock()
     save_events(orphan, range(1, 13), created=clock())
     unit = FakeWorkUnit(make_events(30), state='Running')
     work = FakeReceptorWork({UNIT: unit})
+    real_process_phase = AWXReceptorJob._process_phase
+    sent = []
 
-    for _ in range(3):
-        adopt_job(orphan.id, open_work=lambda: work, clock=clock)
+    def shut_down_after(event_count):
+        def process_phase(receptor_job, stream_work):
+            unit.break_after = event_count
+            real_process_phase(receptor_job, stream_work)
+            receptor_job.detached = True  # the controller is shutting down
+            return None
+
+        return process_phase
+
+    for event_count in (16, 22, 27):
+        with mock.patch.object(AWXReceptorJob, '_process_phase', shut_down_after(event_count)):
+            adopt_job(orphan.id, open_work=lambda: work, clock=clock)
         orphan.refresh_from_db()
         assert orphan.status == 'running'
-        assert RecordingDispatcher.dispatched == []
+        sent += RecordingDispatcher.counters()
+        save_dispatched_events()
+        RecordingDispatcher.reset()
         clock.advance(60)
 
+    unit.break_after = None
     unit.state = 'Succeeded'
     adopt_job(orphan.id, open_work=lambda: work, clock=clock)
+    sent += RecordingDispatcher.counters()
 
     orphan.refresh_from_db()
     assert orphan.status == 'successful'
-    assert RecordingDispatcher.counters() == list(range(13, 31))
+    assert sent == list(range(13, 31))
 
 
 @pytest.mark.django_db
