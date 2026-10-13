@@ -9,7 +9,9 @@ from unittest import mock
 
 import pytest
 
+from awx.main.dispatch import reaper
 from awx.main.models import Job
+from awx.main.tasks import jobs
 from awx.main.tasks.callback import RunnerCallback
 from awx.main.tasks.jobs import _finalize_job_run
 from awx.main.tasks.system import _dispatch_adoption, _process_running_jobs, adopt_job, claim_for_adoption
@@ -253,3 +255,25 @@ def test_adoption_that_loses_ownership_mid_stream_leaves_the_unit(running_job):
     running_job.refresh_from_db()
     assert running_job.status == 'running', 'the new owner finalizes, not the stale adoption'
     assert UNIT in work.units, 'the stale adoption does not release the new owner\'s unit'
+
+
+# ── Writers that don't take ownership ─────────────────────────────────────────
+
+
+@pytest.mark.django_db
+def test_owner_finishing_after_a_reap_does_not_write_a_second_result(running_job):
+    # A reap marks the job failed without taking ownership, so the owner check alone would let
+    # the still-running owner overwrite that result and notify a second time (AAP-96718). The
+    # status check refuses the owner's write: a job gets one terminal result.
+    reaper.reap_job(running_job, 'failed', job_explanation='Job reaped due to instance shutdown')
+    task = jobs.RunJob.__new__(jobs.RunJob)
+    task.model = Job
+    task.instance = running_job
+    task.runner_callback = RunnerCallback(model=Job)
+    task.runner_callback.instance = running_job
+
+    assert task._finalize_and_release(running_job.pk, 'successful', None, ORIGINAL) is True
+
+    assert task.instance is None, 'run() takes a None instance to mean another writer finalized the job'
+    running_job.refresh_from_db()
+    assert running_job.status == 'failed'

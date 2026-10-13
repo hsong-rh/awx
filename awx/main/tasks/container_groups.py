@@ -47,6 +47,7 @@ from awx.main.tasks.receptor import (
     read_receptor_config,
     reattach_to_work_unit,
 )
+from awx.main.utils.update_model import NotOwner
 
 logger = logging.getLogger('awx.main.tasks.container_groups')
 
@@ -277,14 +278,17 @@ def requeue_wedged_job(job):
     return bool(updated)
 
 
-def harvest_terminal_pod(job, pod_name, pod):
+def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None):
     """Recover a finished container-group job from its pod's log.
 
     The pod's stdout is the work unit's stdout, so this feeds the same ansible-runner process
     streamer the live path uses, through the same counter-skip dedup — events already in the
     database are skipped, so replaying the log from the beginning is safe.
 
-    Returns True if the job reached a terminal status, False if it should be retried later.
+    owner_task_id is the adoption's claim; the final status is written only while it still holds.
+
+    Returns True if the job reached a terminal status, or another task now owns it; False if
+    it should be retried later.
     """
     safe_threshold, collision_zone, persisted_ct = _compute_adoption_dedup(job)
     logger.info(
@@ -318,7 +322,10 @@ def harvest_terminal_pod(job, pod_name, pod):
             if hook_error.get('traceback'):
                 callback.delay_update(result_traceback=hook_error['traceback'])
 
-        _finalize_adopted_job(job, callback, exit_code, process_phase_failed=False, final_status=status, pod_name=pod_name)
+        try:
+            _finalize_adopted_job(job, callback, exit_code, process_phase_failed=False, final_status=status, pod_name=pod_name, owner_task_id=owner_task_id)
+        except NotOwner as exc:
+            logger.warning(f'{job.log_format} was claimed by task {exc.current_task_id} while its pod was harvested; not finalizing it')
         return True
     finally:
         shutil.rmtree(private_data_dir, ignore_errors=True)
@@ -367,7 +374,7 @@ def _terminal_status(job, pod, res):
     return ('successful' if exit_code == 0 else 'failed'), exit_code
 
 
-def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None):
+def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None, owner_task_id=None):
     """Take over a container-group job whose pod is still running, by re-submitting it.
 
     The dead controller's work unit is unrecoverable, but the pod is not, and a new work unit
@@ -416,7 +423,7 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None):
         UnifiedJob.objects.filter(pk=job.pk).update(work_unit_id=unit_id)
         job.work_unit_id = unit_id
 
-        return bool(reattach_to_work_unit(job, ReceptorWork(receptor_ctl), unit_status=unit_status, pod_name=pod_name))
+        return bool(reattach_to_work_unit(job, ReceptorWork(receptor_ctl), owner_task_id=owner_task_id, unit_status=unit_status, pod_name=pod_name))
     finally:
         if close_ctl:
             try:
@@ -425,11 +432,14 @@ def attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=None):
                 pass
 
 
-def adopt_container_group_job(job, receptor_ctl=None):
+def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None):
     """Recover a container-group job whose controller died, using its surviving pod.
 
     Called only once the receptor path has established that the work unit is unreachable,
     which for a container group means the submitting controller took it to the grave.
+
+    owner_task_id is the adoption's claim. Harvesting and attaching both finalize the job, so
+    both are fenced by it.
 
     Returns True if the job reached a terminal state (or was requeued) and needs no further
     attention, False if it should be re-triaged on the next heartbeat.
@@ -450,7 +460,7 @@ def adopt_container_group_job(job, receptor_ctl=None):
     logger.info(f'{job.log_format}: container-group pod triage = {state} (pod={pod_name})')
 
     if state == PodState.TERMINAL:
-        return harvest_terminal_pod(job, pod_name, pod)
+        return harvest_terminal_pod(job, pod_name, pod, owner_task_id=owner_task_id)
 
     if state == PodState.WEDGED:
         if not delete_job_pod(job, pod_name):
@@ -471,7 +481,7 @@ def adopt_container_group_job(job, receptor_ctl=None):
         return True
 
     if state == PodState.STREAMING:
-        return attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=receptor_ctl)
+        return attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=receptor_ctl, owner_task_id=owner_task_id)
 
     # WAITING defers. The pod is silent and still inside the wedge budget, so a slow start and
     # a wedge are indistinguishable; the next triage tells them apart. It is deliberately not
