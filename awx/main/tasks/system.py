@@ -1059,8 +1059,7 @@ def _process_running_jobs(this_inst, active_task_ids, ref_time):
     - Dispatched, with this node only its execution node → leave it for the orphan sweep.
     - Undispatched or owned by a lost controller → reap.
 
-    The query narrows the candidates; running_job_action decides adopt or reap, and the
-    two cross-controller exceptions to reaping are checked here.
+    The query narrows the candidates; running_job_action makes the decision for each one.
     """
     workflow_ctype_id = ContentType.objects.get_for_model(WorkflowJob).id
     base_q = Q(status='running') & (Q(execution_node=this_inst.hostname) | Q(controller_node=this_inst.hostname))
@@ -1081,18 +1080,10 @@ def _process_running_jobs(this_inst, active_task_ids, ref_time):
 
     for j in jobs:
         try:
-            action = running_job_action(j, this_inst.hostname, active_task_ids, ref_time, workflow_ctype_id)
+            action = running_job_action(j, this_inst.hostname, active_task_ids, ref_time, workflow_ctype_id, live_controller_hostnames)
             if action == JobAction.ADOPT:
                 _dispatch_adoption(j)
-            elif action != JobAction.REAP:
-                pass
-            elif j.controller_node != this_inst.hostname and j.controller_node in live_controller_hostnames:
-                # Another live controller owns this job; let it handle adoption or reaping
-                pass
-            elif j.work_unit_id:
-                # This node is the execution node but not the controller; orphan sweep adopts it.
-                pass
-            else:
+            elif action == JobAction.REAP:
                 reaper.reap_job(j, 'failed')
         except Exception:
             logger.exception(f'Failed processing job {j.id} in heartbeat job loop')
