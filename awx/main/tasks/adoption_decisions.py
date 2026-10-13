@@ -170,13 +170,18 @@ def running_job_action(job, this_hostname, active_task_ids, ref_time, workflow_c
     return JobAction.REAP
 
 
-def adoption_deadline_passed(last_event_time, started, ref_time, timeout_seconds):
-    """True if a job has been silent too long to adopt.
+def stall_budget_exhausted(stalled_since, last_event_time, ref_time, timeout_seconds):
+    """True if an adoption that cannot make progress has been stalled too long to keep retrying.
 
-    Silence is measured from the last saved event, or from the start when there are no
-    events. A job with neither is never past the deadline.
+    stalled_since is when this controller first recorded the stall, or None if it has no
+    record; that is when the budget starts, not the job's last event. A playbook can run
+    for longer than the timeout without emitting an event, and measuring from that event
+    failed such a job on its first transient error after a controller restart (AAP-96829).
+    An event saved after the stall began proves progress, so the newer of the two is used.
+    With no record the budget is never exhausted: losing it only defers longer.
     """
-    orphaned_since = last_event_time or started
-    if not orphaned_since:
+    if stalled_since is None:
         return False
-    return orphaned_since < ref_time - timedelta(seconds=timeout_seconds)
+    if last_event_time and last_event_time > stalled_since:
+        stalled_since = last_event_time
+    return stalled_since < ref_time - timedelta(seconds=timeout_seconds)
