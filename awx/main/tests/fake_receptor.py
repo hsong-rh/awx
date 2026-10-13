@@ -7,7 +7,8 @@ protocol the ansible-runner worker writes, so AWX's real process-phase code pars
 Failures are injected per unit:
   - break_after=N: the stream ends after N events with no status or eof, as when the
     connection to the execution node drops.
-  - status_error: status() raises, as when the node is unreachable. adopt() raises too.
+  - status_error: status() raises, as when the node is unreachable. adopt() and cancel() raise too.
+  - results_error: results() raises, as when the results stream cannot be opened or breaks.
   - remote_only: this controller's receptor does not hold the unit, so status() and results()
     raise until adopt() takes it over from the execution node.
   - released units disappear, and releasing or reading an unknown unit raises like receptor.
@@ -52,7 +53,9 @@ def make_events(count, failed_tasks=()):
 
 
 class FakeWorkUnit:
-    def __init__(self, events=(), status='successful', state=None, exit_code=None, detail='', break_after=None, status_error=None, remote_only=False):
+    def __init__(
+        self, events=(), status='successful', state=None, exit_code=None, detail='', break_after=None, status_error=None, remote_only=False, results_error=None
+    ):
         self.events = list(events)
         self.status = status
         self.state = state or TERMINAL_STATE.get(status, 'Succeeded')
@@ -61,6 +64,7 @@ class FakeWorkUnit:
         self.break_after = break_after
         self.status_error = status_error
         self.remote_only = remote_only
+        self.results_error = results_error
 
     def stream(self):
         lines = []
@@ -108,12 +112,18 @@ class FakeReceptorWork(ReceptorWork):
 
     def results(self, unit_id, startpos=None):
         self.calls.append(('results', unit_id, startpos))
-        data = self._unit(unit_id).stream()
+        unit = self._unit(unit_id)
+        if unit.results_error:
+            raise unit.results_error
+        data = unit.stream()
         return FakeSocket(), io.BytesIO(data[startpos or 0 :])
 
     def cancel(self, unit_id):
         self.calls.append(('cancel', unit_id))
-        self._unit(unit_id).state = 'Failed'
+        unit = self._unit(unit_id)
+        if unit.status_error:
+            raise unit.status_error
+        unit.state = 'Failed'
 
     def release(self, unit_id):
         self.calls.append(('release', unit_id))
