@@ -10,7 +10,7 @@ import pytest
 
 from awx.main.models import Job, JobEvent
 from awx.main.tasks.receptor import reattach_to_work_unit
-from awx.main.tasks.system import awx_receptor_workunit_reaper
+from awx.main.tasks.system import adopt_job, awx_receptor_workunit_reaper
 from awx.main.tests.fake_receptor import FakeReceptorWork, FakeWorkUnit, RecordingDispatcher, make_events
 
 UNIT = 'unit-1'
@@ -138,3 +138,17 @@ def test_workunit_reaper_releases_units_of_finished_jobs(me_inst, settings):
     assert ('cancel', finished.work_unit_id) in work.calls
     assert finished.work_unit_id not in work.units
     assert running.work_unit_id in work.units
+
+
+@pytest.mark.django_db
+def test_unit_known_only_to_its_execution_node_is_adopted_from_it(running_job):
+    # The cross-controller case: this controller's receptor never held the unit, so it is
+    # adopted from the execution node, then streamed and finalized as usual.
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10), remote_only=True)})
+
+    adopt_job(running_job.id, open_work=lambda: work)
+
+    running_job.refresh_from_db()
+    assert running_job.status == 'successful'
+    assert ('adopt', 'receptor-1', UNIT) in work.calls
+    assert RecordingDispatcher.counters() == list(range(1, 11))

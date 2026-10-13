@@ -1886,8 +1886,9 @@ def test_adopt_job_async_reaps_on_timeout(me_inst, settings):
         adopt_job_async(job.id, source_controller=me_inst.hostname)
 
     mock_reap.assert_called_once()
-    # The timeout branch returns early — the control socket must still be closed.
-    mock_ctl.close.assert_called_once()
+    # The timeout branch returns early — the control socket must still be closed. ReceptorWork
+    # also drops it after each failed command, so it is the last thing done to the connection.
+    assert mock_ctl.method_calls[-1] == mock.call.close()
     # The cancel is expected to fail on an unreachable unit, so it must not log a traceback.
     mock_log.exception.assert_not_called()
     assert any('Failed to cancel work unit' in call.args[0] for call in mock_log.warning.call_args_list)
@@ -1914,7 +1915,7 @@ def test_adopt_job_async_closes_receptor_ctl_when_reap_raises(me_inst, settings)
         with pytest.raises(RuntimeError):
             adopt_job_async(job.id, source_controller=me_inst.hostname)
 
-    mock_ctl.close.assert_called_once()
+    assert mock_ctl.method_calls[-1] == mock.call.close()
 
 
 @pytest.mark.django_db

@@ -90,7 +90,6 @@ from awx.main.tasks.receptor import (
     ReceptorWork,
     _adoption_stall_budget_exhausted,
     administrative_workunit_reaper,
-    reset_receptor_connection,
     clear_adoption_stall,
     get_adoption_unit_status,
     get_receptor_ctl,
@@ -1598,8 +1597,7 @@ def awx_receptor_workunit_reaper():
                 release_work_unit(receptor_ctl, job.work_unit_id, receptor_work_list)
         except Exception:
             logger.warning(f"Failed to reap work unit {job.work_unit_id}", exc_info=True)
-            # A failed command leaves its reply unread on the connection; drop it before the release.
-            reset_receptor_connection(receptor_ctl)
+            # ReceptorWork drops the connection after a failed command, so the release does not read its error.
             # A cancel failure must not skip this unit's own release attempt.
             release_work_unit(receptor_ctl, job.work_unit_id, receptor_work_list)
 
