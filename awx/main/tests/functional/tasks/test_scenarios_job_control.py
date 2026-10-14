@@ -13,7 +13,7 @@ keeping the job active.
 
 import pytest
 
-from awx.main.models import InstanceGroup, Job, JobTemplate, WorkflowJob, WorkflowJobNode
+from awx.main.models import Instance, InstanceGroup, Job, JobTemplate, WorkflowJob, WorkflowJobNode
 from awx.main.tasks.system import adopt_job
 from awx.main.tests.adoption_cluster import (
     EXEC,
@@ -184,6 +184,90 @@ def test_lost_controllers_job_does_not_leave_its_playbook_running(make_job):
 
     assert_playbook_not_left_running(job, work)
     assert job.controller_node == THIS
+
+
+# Each card symptom above, asserted directly rather than through the shared "unit was canceled" check.
+
+
+@pytest.mark.django_db
+def test_relaunch_of_an_orphaned_job_stays_blocked():
+    # 4.12 Relaunching an orphaned job (AAP-96834). The template does not allow simultaneous
+    # runs, so a relaunch waits while the job is active. Devel ends the orphaned job, so the
+    # relaunch starts on the same hosts while the playbook still runs.
+    make_cluster()
+    job = job_of_template_without_simultaneous_runs()
+
+    run_lost_instance_handling(mesh(EXEC), work=running_unit())
+
+    job.refresh_from_db()
+    assert job.status in ('running', 'waiting')
+
+
+@pytest.mark.django_db
+def test_orphaned_job_still_counts_toward_its_instance_group_limit():
+    # 4.17 Instance group job limits (AAP-96837). The group's limit counts active jobs. Devel
+    # ends the orphaned job, so the group shows a free slot while the playbook still runs.
+    make_cluster()
+    job = job_in_limited_instance_group()
+
+    run_lost_instance_handling(mesh(EXEC), work=running_unit())
+
+    job.refresh_from_db()
+    assert Job.objects.filter(instance_group=job.instance_group, status__in=('running', 'waiting')).count() == 1
+
+
+@pytest.mark.django_db
+def test_orphaned_job_still_uses_its_execution_node_capacity():
+    # 4.23 Execution node at full capacity (AAP-96841). The node's consumed capacity counts
+    # running and waiting jobs. Devel ends the orphaned job, so the node reports 0 of 84 while
+    # the playbook still runs.
+    make_cluster()
+    peer_job(task_impact=84)
+
+    run_lost_instance_handling(mesh(EXEC), work=running_unit())
+
+    assert Instance.objects.get(hostname=EXEC).consumed_capacity == 84
+
+
+@pytest.mark.parametrize(
+    'make_job',
+    [
+        pytest.param(job_in_workflow, id='AAP-96833-nested-workflow'),
+        pytest.param(job_in_workflow, id='AAP-96844-workflow-branch'),
+    ],
+)
+@pytest.mark.django_db
+def test_orphaned_job_that_succeeds_ends_successful(make_job):
+    # 4.11 Nested workflows (AAP-96833) and 5.5 Workflow with an orphaned node (AAP-96844). A
+    # workflow takes its success branch when the job ends successful. Devel ends the orphaned
+    # job failed, so the workflow takes the failure branch although the playbook succeeds.
+    make_cluster()
+    job = make_job()
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10))})
+
+    run_lost_instance_handling(mesh(EXEC), work=work)
+    adopt_claimed([job], work)
+
+    job.refresh_from_db()
+    assert job.status == 'successful'
+
+
+@pytest.mark.django_db
+def test_set_stats_artifacts_of_an_orphaned_job_are_kept():
+    # 5.6 set_stats artifacts in a workflow (AAP-96845). The playbook's set_stats becomes the
+    # job's artifacts, which later workflow nodes read. Devel ends the orphaned job failed, so
+    # its artifacts are never recorded.
+    make_cluster()
+    job = job_in_workflow()
+    events = make_events(10)
+    events[-1]['event_data']['artifact_data'] = {'release': '2.5'}
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(events)})
+
+    run_lost_instance_handling(mesh(EXEC), work=work)
+    adopt_claimed([job], work)
+
+    job.refresh_from_db()
+    assert job.artifacts == {'release': '2.5'}
 
 
 # ── Waiting jobs of a lost controller ─────────────────────────────────────────
