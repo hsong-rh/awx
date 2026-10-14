@@ -45,8 +45,6 @@ logger = logging.getLogger('awx.main.utils.failpoints')
 # Every failpoint name must be registered here. A call with an unknown name raises when
 # failpoints are enabled, so a typo in a test or in the code fails loudly instead of
 # silently never firing.
-# devel has same-controller adoption only (PR #16636): there is no cross-controller claim,
-# orphan sweep or shutdown announcement, so those failpoints do not exist on this branch.
 REGISTRY = {
     'mesh.ignore_advertisement': 'inspect_execution_and_hop_nodes: a mesh advertisement from an execution or hop node (ctx: advertised). A fired hit skips it, so the node looks unseen.',
     'heartbeat.start': 'Start of cluster_node_heartbeat, before instance management. Pausing it makes this node miss heartbeats while staying alive.',
@@ -63,6 +61,11 @@ REGISTRY = {
     'events.stats_after_insert': 'Stats event: host summaries inserted (ctx: new, metric_hosts), before the host metrics update.',
     'adoption.unit_status': 'reattach_to_work_unit: about to query the work unit status. raise here reads as an unreachable unit.',
     'health_check.redis_ping': 'Instance.local_health_check: about to ping Redis. raise --exception redis.exceptions.ConnectionError marks this node unavailable.',
+    'lost_instance.before_claim': 'Lost-instance path: job judged adoptable and capacity available, before the claim UPDATE.',
+    'sweep.before_claim': 'Orphan sweep: capacity available, before the claim UPDATE.',
+    'adoption.before_adoption_published': '_publish_adoption: the adoption task id is on the job, the task not yet published (a cancel here reaches no worker).',
+    'adoption.after_claim': 'adopt_job_async: job claimed for this controller, before the capacity check and streaming.',
+    'adoption.before_task_id_saved': 'claim_for_adoption: the new celery_task_id is chosen, before the claim UPDATE writes it (a cancel here is addressed to the old owner).',
 }
 
 ACTIONS = ('pause', 'sleep', 'raise', 'kill', 'kill_parent')
