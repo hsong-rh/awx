@@ -937,6 +937,7 @@ def _handle_lost_instance_job(j, other_inst):
         reaper.reap_job(j, 'failed', job_explanation='Job reaped due to instance shutdown')
         return
 
+    failpoint('lost_instance.before_claim', job_id=j.id, lost=other_inst.hostname)
     task_id = claim_for_adoption(j, new_controller=settings.CLUSTER_HOST_ID)
     if task_id is None:
         logger.info(f'Cross-controller adoption skipped for job {j.id}: already claimed by another controller')
@@ -1117,12 +1118,14 @@ def claim_for_adoption(job, new_controller=None):
     updates = {'celery_task_id': task_id}
     if new_controller:
         updates['controller_node'] = new_controller
+    failpoint('adoption.before_task_id_saved', job_id=job.id, task_id=task_id)
     claimed = UnifiedJob.objects.filter(pk=job.id, status='running', controller_node=job.controller_node, celery_task_id=job.celery_task_id).update(**updates)
     return task_id if claimed else None
 
 
 def _publish_adoption(job_id, task_id):
     """Dispatch the adoption of a claimed job under the task id its claim recorded."""
+    failpoint('adoption.before_adoption_published', job_id=job_id, task_id=task_id)
     adopt_job_async.apply_async(args=[job_id], kwargs={'owner_task_id': task_id}, uuid=task_id, queue=get_task_queuename())
 
 
@@ -1199,6 +1202,7 @@ def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None):
             if not _room_for_another_controllers_job():
                 logger.info(f'Orphan sweep stopping at {swept} adoptions: out of control capacity, peer or next heartbeat takes the rest')
                 break
+            failpoint('sweep.before_claim', job_id=orphan.id, former=orphan.controller_node)
             if _dispatch_adoption(orphan, new_controller=this_inst.hostname) is None:
                 # Another node swept it between the query and here, or it just finished.
                 continue
@@ -1480,6 +1484,7 @@ def adopt_job_async(job_id, source_controller=None, owner_task_id=None):
             this adoption does nothing. A message published by a pre-AAP-89602 controller
             during a rolling upgrade carries args=[job_id] only and is checked by owner alone.
     """
+    failpoint('adoption.after_claim', job_id=job_id)
     adopt_job(job_id, open_work=lambda: ReceptorWork(get_receptor_ctl()), owner_task_id=owner_task_id)
 
 
