@@ -143,6 +143,31 @@ class TestEvents:
         for hm in HostMetric.objects.all():
             assert hm.automated_counter == 1
 
+    def test_concurrent_stats_do_not_double_count_host_metrics(self):
+        # The sequential replay above is skipped by reading the recorded summaries up front. Two
+        # writers can also both read nothing recorded and then both insert: the loser's insert is
+        # dropped by ignore_conflicts, so it must not count the hosts it did not record.
+        from awx.main.models import events as events_module
+
+        self._generate_hosts(5)
+        stats = dict((hostname, len(hostname)) for hostname in self.hostnames)
+        real_failpoint = events_module.failpoint
+        peer_ran = []
+
+        def peer_finishes_first(name, **ctx):
+            if name == 'events.stats_before_insert' and not peer_ran:
+                peer_ran.append(ctx)
+                self._create_job_event(ok=stats, parent_uuid='peer')
+            return real_failpoint(name, **ctx)
+
+        with mock.patch.object(events_module, 'failpoint', peer_finishes_first):
+            self._create_job_event(ok=stats)
+
+        assert peer_ran and peer_ran[0]['existing'] == 0
+        assert self.job.job_host_summaries.count() == len(self.hostnames)
+        for hm in HostMetric.objects.all():
+            assert hm.automated_counter == 1
+
     def test_host_metrics_insert(self):
         self._generate_hosts(10)
 
