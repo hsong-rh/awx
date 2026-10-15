@@ -3894,6 +3894,18 @@ def synthetic_stats_race(containers, args, job_id, m):
         f"from awx.main.models import HostMetric\nemit(dict(HostMetric.objects.filter(hostname__in={DC_HOSTS!r}).values_list('hostname', 'automated_counter')))\n",
     )
     m['synthetic'] = {'deleted_summaries': n, 'metrics_before': before}
+    # The job's own run already counted each host once and its summaries are gone, so one
+    # legitimate reprocess adds one more: re-base the host_metrics_counted_once snapshot here.
+    orm(
+        c0,
+        f'''
+from django.db import connection
+from awx.main.utils.failpoints import SNAPSHOT_TABLE
+with connection.cursor() as cursor:
+    cursor.execute(f"UPDATE {{SNAPSHOT_TABLE}} SET data = %s::jsonb WHERE kind = 'host_metrics' AND key = %s", [json.dumps({before!r}), {str(job_id)!r}])
+    emit(cursor.rowcount)
+''',
+    )
     manage(c0, 'failpoint', 'clear-hits')
     arm(c0, 'events.stats_before_insert', 'pause', {'job_id': job_id}, timeout=600)
     arm(c0, 'events.stats_after_insert', 'sleep', {'job_id': job_id}, seconds=0)
@@ -4557,7 +4569,7 @@ def iptables(container, *rule):
 def scenario_db_restart(containers, args):
     """Database restart during adoption: hold the adopter at a seam, restart Postgres, release.
 
-      --variant claim     PR: lost path claimed, held at adoption.before_queue (before the publish)
+      --variant claim     PR: lost path claimed, held at adoption.before_adoption_published (before the publish)
       --variant snapshot  PR: adopt_job_async held at adoption.after_claim (before the dedup snapshot)
       --variant finalize  held at adoption.before_finalize (stream done, status not saved); PR cross-node,
                           devel same-node (the owner restarts and re-adopts)
@@ -4568,7 +4580,9 @@ def scenario_db_restart(containers, args):
     need_two(containers, 'db-restart')
     c0 = containers[0]
     pr = is_pr_branch(c0)
-    seam = {'claim': 'adoption.before_queue', 'snapshot': 'adoption.after_claim', 'finalize': 'adoption.before_finalize', 'stream': None}[args.variant]
+    seam = {'claim': 'adoption.before_adoption_published', 'snapshot': 'adoption.after_claim', 'finalize': 'adoption.before_finalize', 'stream': None}[
+        args.variant
+    ]
     if not pr and args.variant in ('claim', 'snapshot'):
         raise SystemExit('db-restart claim/snapshot: does not apply on devel (no cross-node claim)')
     since = since_now()
