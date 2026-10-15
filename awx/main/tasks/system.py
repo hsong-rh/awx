@@ -885,6 +885,11 @@ def _heartbeat_instance_management(clock=None):
 
     lost_instances = gate_lost_instances(lost_instances, lambda: _mesh_all_ready_nodes_visible(mesh_status))
 
+    if mesh_status is not None and not settings.IS_K8S:
+        # A control node still on the mesh is alive however stale its last_seen; K8s control pods are not peered.
+        on_mesh = mesh_hostnames(mesh_status)
+        lost_instances = [inst for inst in lost_instances if inst.node_type in ('execution', 'hop') or inst.hostname not in on_mesh]
+
     return this_inst, instance_list, lost_instances, ctl
 
 
