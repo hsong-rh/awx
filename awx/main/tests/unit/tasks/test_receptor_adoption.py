@@ -1501,9 +1501,10 @@ def test_finalize_job_run_logs_lifecycle(mock_update, mock_hook, mock_task_mgr, 
 
 
 def test_populate_host_map_from_inventory_populates_host_map():
-    """The adoption path sources host_map by fetching script_data itself."""
+    """The adoption path sources host_map by fetching script_data itself when job_env has no snapshot."""
     cb = RunnerCallback(model=None)
     instance = Mock()
+    instance.job_env = {}
     instance.inventory_id = 42
     instance.inventory.get_script_data.return_value = {
         '_meta': {
@@ -1523,6 +1524,7 @@ def test_populate_host_map_from_inventory_swallows_error():
     """If fetching inventory hosts raises, the exception is swallowed and host_map stays {}."""
     cb = RunnerCallback(model=None)
     instance = Mock()
+    instance.job_env = {}
     instance.inventory_id = 1
     instance.inventory.get_script_data.side_effect = Exception('DB error')
 
@@ -1535,6 +1537,7 @@ def test_populate_host_map_from_inventory_skips_job_without_inventory():
     """No inventory means no query — an inventory-less job must not hit get_script_data."""
     cb = RunnerCallback(model=None)
     instance = Mock()
+    instance.job_env = {}
     instance.inventory_id = None
 
     cb.populate_host_map_from_inventory(instance)

@@ -32,13 +32,19 @@ def _snapshot(hosts):
     return {h.name: h.id for h in hosts}
 
 
+def _set_host_map_snapshot(job, snap):
+    """Simulate RunnerCallback.status_handler persisting the job-start host_map (AAP-96843)."""
+    job.job_env = {'host_map': snap}
+    job.save(update_fields=['job_env'])
+
+
 @pytest.mark.django_db
 def test_host_ids_match_when_events_and_summaries_use_job_start_ids(job, hosts):
     for i, h in enumerate(hosts, start=1):
         _event(job, i, host=h)
         JobHostSummary.objects.create(job=job, host=h, host_name=h.name)
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=_snapshot(hosts)):
-        result = job_invariants.check_host_ids_match_job_start(job)
+    _set_host_map_snapshot(job, _snapshot(hosts))
+    result = job_invariants.check_host_ids_match_job_start(job)
     assert result['ok'], result
 
 
@@ -55,8 +61,8 @@ def test_host_ids_flag_replayed_events_with_rebuilt_map(job, hosts, inventory):
     h3.delete()
     h3_new = inventory.hosts.create(name='h3')
     _event(job, 4, host=h3_new)
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=snap):
-        result = job_invariants.check_host_ids_match_job_start(job)
+    _set_host_map_snapshot(job, snap)
+    result = job_invariants.check_host_ids_match_job_start(job)
     assert not result['ok']
     assert 'h2' in result['detail'] and f'h3 [{h3_new.id}] != {h3_old}' in result['detail']
 
@@ -69,27 +75,27 @@ def test_host_summaries_expect_none_for_deleted_hosts(job, hosts, inventory):
     replacement = inventory.hosts.create(name='h2')
     JobHostSummary.objects.create(job=job, host=h1, host_name='h1')
     JobHostSummary.objects.create(job=job, host=replacement, host_name='h2')
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=snap):
-        result = job_invariants.check_host_ids_match_job_start(job)
+    _set_host_map_snapshot(job, snap)
+    result = job_invariants.check_host_ids_match_job_start(job)
     assert not result['ok']
     assert f'summaries: h2 {replacement.id} != None' in result['detail']
 
     JobHostSummary.objects.filter(job=job, host_name='h2').update(host=None)
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=snap):
-        assert job_invariants.check_host_ids_match_job_start(job)['ok']
+    assert job_invariants.check_host_ids_match_job_start(job)['ok']
 
 
 @pytest.mark.django_db
 def test_host_ids_without_snapshot_checks_consistency(job, hosts, inventory):
+    """job.job_env has no 'host_map' key: a job that predates AAP-96843, or started before
+
+    status_handler's 'starting' branch ever ran."""
     h1 = hosts[0]
     _event(job, 1, host=h1)
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=None):
-        result = job_invariants.check_host_ids_match_job_start(job)
+    result = job_invariants.check_host_ids_match_job_start(job)
     assert result['ok'] and 'consistency only' in result['detail']
 
     JobEvent.objects.create(job=job, counter=2, event='runner_on_ok', job_created=job.created, host_name='h1', host_id=None)
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=None):
-        result = job_invariants.check_host_ids_match_job_start(job)
+    result = job_invariants.check_host_ids_match_job_start(job)
     assert not result['ok'] and 'h1' in result['detail']
 
 
@@ -259,13 +265,12 @@ def test_host_ids_constructed_inventory_summaries(organization, inventory, hosts
     for i, (c, h) in enumerate(zip(chosts, hosts), start=1):
         _event(job, i, host=c)
         JobHostSummary.objects.create(job=job, host=h, constructed_host=c, host_name=c.name)
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=snap):
-        result = job_invariants.check_host_ids_match_job_start(job)
+    _set_host_map_snapshot(job, snap)
+    result = job_invariants.check_host_ids_match_job_start(job)
     assert result['ok'], result
 
     JobHostSummary.objects.filter(job=job, host_name='h2').update(host=None, constructed_host=hosts[1])
-    with mock.patch.object(job_invariants, 'get_snapshot', return_value=snap):
-        result = job_invariants.check_host_ids_match_job_start(job)
+    result = job_invariants.check_host_ids_match_job_start(job)
     assert not result['ok']
     assert f'h2 constructed_host_id {hosts[1].id} != {chosts[1].id}' in result['detail']
     assert f'h2 host_id None != {hosts[1].id}' in result['detail']

@@ -1646,7 +1646,7 @@ def hostmap_analysis(container, job_id, original, threshold):
         container,
         f'''
 from django.db.models import Count, Min, Max
-from awx.main.models import Job
+from awx.main.models import Host, Job
 j = Job.objects.get(pk={job_id})
 qs = j.get_event_queryset().exclude(host_name='')
 thr = {threshold!r}
@@ -1658,7 +1658,8 @@ if thr is not None:
     for r in qs.filter(counter__gt=thr).values('host_name', 'host_id').annotate(n=Count('id')).order_by('host_name', 'host_id'):
         replayed.append(r)
 summ = list(j.job_host_summaries.values('host_name', 'host_id', 'ok', 'failures', 'dark').order_by('host_name'))
-emit(dict(original={original!r}, threshold=thr, events_by_host=rows, events_above_threshold=replayed, summaries=summ))
+existing = list(Host.objects.filter(pk__in={original!r}.values()).values_list('pk', flat=True))
+emit(dict(original={original!r}, threshold=thr, events_by_host=rows, events_above_threshold=replayed, summaries=summ, existing=existing))
 ''',
     )
 
@@ -1719,8 +1720,13 @@ def scenario_host_map(containers, args):
         tag = 'original' if original.get(r['host_name']) == r['host_id'] else 'NOT ORIGINAL'
         print(f"    {r['host_name']:<6} host_id={r['host_id']!s:<6} n={r['n']:<4} {tag}")
     print('  job host summaries:')
+    existing = set(a['existing'])
     for r in a['summaries']:
-        tag = 'original' if original.get(r['host_name']) == r['host_id'] else 'NOT ORIGINAL'
+        orig_id = original.get(r['host_name'])
+        # A summary nulls host_id when that host has since been deleted (on_delete=SET_NULL,
+        # jobs.py:1101), so None is the correct value there, not a drift from the original id.
+        want = orig_id if orig_id in existing else None
+        tag = 'original' if r['host_id'] == want else 'NOT ORIGINAL'
         print(f"    {r['host_name']:<6} host_id={r['host_id']!s:<6} ok={r['ok']} failures={r['failures']} dark={r['dark']}  {tag}")
     notes.append(f'host map analysis: {json.dumps(a, default=str)}')
     result = report(containers, job_id, since, args, unit, notes)
