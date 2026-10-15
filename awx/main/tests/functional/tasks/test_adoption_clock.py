@@ -39,7 +39,8 @@ def lost_hostnames(clock):
     # ctrl-0 is alive: its own last heartbeat was written by its own clock.
     Instance.objects.filter(hostname='ctrl-0').update(last_seen=clock())
     ctl = mock.MagicMock()
-    ctl.simple_command.return_value = {'KnownConnectionCosts': {'ctrl-0': {'ctrl-1': 1}}, 'Advertisements': []}
+    # ctrl-0 has no route to the peer, so the judgement rests on last_seen alone.
+    ctl.simple_command.return_value = {'KnownConnectionCosts': {'ctrl-0': {}}, 'Advertisements': []}
     with (
         mock.patch('awx.main.tasks.system.get_receptor_ctl', return_value=ctl),
         mock.patch('awx.main.tasks.system.inspect_execution_and_hop_nodes'),

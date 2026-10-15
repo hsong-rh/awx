@@ -25,7 +25,6 @@ def peer_job():
     return Job.objects.create(controller_node=PEER, execution_node=EXEC, status='running', work_unit_id=UNIT, celery_task_id='peer-task')
 
 
-@pytest.mark.xfail(strict=True, reason='AAP-96824: a controller that misses heartbeats is judged lost while it still runs its job')
 @pytest.mark.django_db
 def test_slow_controller_still_on_the_mesh_keeps_its_job(peer_job):
     # 2.1 Slow controller. ctrl-1 has missed two heartbeats but is still connected on the
@@ -39,6 +38,29 @@ def test_slow_controller_still_on_the_mesh_keeps_its_job(peer_job):
     peer_job.refresh_from_db()
     assert peer_job.status == 'running'
     assert peer_job.controller_node == PEER
+
+
+@pytest.mark.django_db
+def test_control_peer_on_the_mesh_is_not_handled_as_lost(peer_job):
+    make_cluster()
+
+    assert run_lost_instance_handling(mesh(PEER, EXEC)) == []
+
+
+@pytest.mark.django_db
+def test_unreadable_mesh_keeps_the_last_seen_judgement(peer_job):
+    make_cluster()
+
+    assert run_lost_instance_handling(None) == [PEER]
+
+
+@pytest.mark.django_db
+def test_kubernetes_control_peer_on_the_mesh_keeps_the_last_seen_judgement(settings, peer_job):
+    # K8s control pods are not peered on the mesh, so mesh presence says nothing about them.
+    settings.IS_K8S = True
+    make_cluster()
+
+    assert run_lost_instance_handling(mesh(PEER, EXEC)) == [PEER]
 
 
 @pytest.mark.django_db
