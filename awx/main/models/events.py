@@ -17,6 +17,8 @@ from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 from django.utils.encoding import force_str
 
+from ansible_base.lib.utils.db import advisory_lock
+
 from awx.api.versioning import reverse
 from awx.main import consumers
 from awx.main.fields import JSONBlob
@@ -579,7 +581,6 @@ class JobEvent(BasePlaybookEvent):
             already_recorded = set(JobHostSummary.objects.filter(job_id=job.id).values_list('host_name', flat=True))
 
             summaries = dict()
-            updated_hosts_list = list()
             for host in hostnames:
                 if host in already_recorded:
                     continue
@@ -600,19 +601,23 @@ class JobEvent(BasePlaybookEvent):
                 summaries[(host_id, host)] = summary
 
                 # do not count dark / unreachable hosts as updated
-                if not bool(summary.dark):
-                    updated_hosts_list.append(host.lower())
-                else:
+                if bool(summary.dark):
                     logger.warning(f'host {host.lower()} is dark / unreachable, not marking it as updated')
 
-            # ignore_conflicts is the backstop for a genuine cross-process race, where the
-            # peer writes between the query above and this insert.
             failpoint('events.stats_before_insert', job_id=job.id, new=len(summaries), existing=0)
-            JobHostSummary.objects.bulk_create(summaries.values(), ignore_conflicts=True)
-            failpoint('events.stats_after_insert', job_id=job.id, new=len(summaries), metric_hosts=len(updated_hosts_list))
+            # Two writers can both read nothing recorded above, so they take turns and look again:
+            # only the writer whose summaries land may count the hosts (the host metrics update
+            # cannot tell a dropped insert from a kept one). ignore_conflicts is the backstop.
+            with advisory_lock(f'job_host_summary_{job.id}'), transaction.atomic():
+                recorded = set(JobHostSummary.objects.filter(job_id=job.id).values_list('host_name', flat=True))
+                summaries = {key: summary for key, summary in summaries.items() if summary.host_name not in recorded}
+                # do not count dark / unreachable hosts as updated
+                updated_hosts_list = [summary.host_name.lower() for summary in summaries.values() if not summary.dark]
+                JobHostSummary.objects.bulk_create(summaries.values(), ignore_conflicts=True)
+                failpoint('events.stats_after_insert', job_id=job.id, new=len(summaries), metric_hosts=len(updated_hosts_list))
 
-            # Create/update Host Metrics
-            self._update_host_metrics(updated_hosts_list)
+                # Create/update Host Metrics
+                self._update_host_metrics(updated_hosts_list)
 
     @staticmethod
     def _update_host_metrics(updated_hosts_list):
