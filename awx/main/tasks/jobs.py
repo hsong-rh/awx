@@ -900,6 +900,18 @@ class BaseTask(object):
                     exc_info=True,
                 )
                 return
+            if signal_callback() and not isinstance(self.instance, SystemJob) and (receptor_job is None or receptor_job.unit_id is None):
+                # The pod stops all its containers at once, so receptor can die after the pre-EE
+                # signal check and before a work unit exists. Nothing reached an EE and no
+                # work_unit_id was saved, so the orphan scan can never find this job: re-dispatch
+                # it like the pre-EE check does. System jobs are excluded: they run ansible-runner
+                # inside this pod, so they may already have done work. A user cancel arrives as the
+                # same signal, so re-read cancel_flag, which was set after this task loaded the job.
+                self.instance = self.update_model(pk)
+                if not self.instance.cancel_flag:
+                    logger.info(f'{self.instance.log_format} lost receptor to a shutdown before reaching EE; resetting to pending', exc_info=True)
+                    self.instance = self.update_model(pk, status='pending', controller_node='', execution_node='')
+                    return
             # this could catch programming or file system errors
             self.runner_callback.delay_update(result_traceback=traceback.format_exc())
             logger.exception('%s Exception occurred while running task', self.instance.log_format)
