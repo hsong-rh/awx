@@ -180,13 +180,17 @@ class RunnerCallback:
             self.host_map[hostname] = hv.get('remote_tower_id', '')
 
     def populate_host_map_from_inventory(self, instance):
-        """Adoption path: fetch script_data ourselves, since no inventory file is written.
+        """Adoption path: prefer the host_map snapshotted at job start, since the inventory may
 
-        The normal path hands us the script_data build_inventory already built, so it never
-        pays for this query. Sourcing host_map from the same script_data either way is what
-        keeps adoption honoring inventory type (smart, constructed), enabled state and
-        job slicing.
+        have changed while the job was orphaned. Jobs started before this snapshot existed
+        (rolling upgrade) have no 'host_map' key in job_env, so fall back to fetching script_data
+        ourselves — this rebuilds the map from the inventory as it is *now*, which is only right
+        for a job whose inventory never changed during the outage.
         """
+        snapshot = (instance.job_env or {}).get('host_map')
+        if snapshot:
+            self.host_map = dict(snapshot)
+            return
         if not (hasattr(instance, 'inventory') and instance.inventory_id):
             return
         try:
@@ -355,6 +359,9 @@ class RunnerCallback:
             for k, v in self.safe_env.items():
                 if k in job_env:
                     job_env[k] = v
+            # Snapshot hostname -> id as of job start, so adoption can replay with these ids
+            # instead of rebuilding the map from whatever the inventory looks like by then.
+            job_env['host_map'] = self.host_map
             from awx.main.signals import disable_activity_stream  # Circular import
 
             with disable_activity_stream():

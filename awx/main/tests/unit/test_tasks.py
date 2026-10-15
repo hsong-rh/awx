@@ -504,6 +504,7 @@ class TestGenericRun:
         task = jobs.RunJob()
         task.runner_callback.instance = job
         task.runner_callback.safe_env = {'secret_key': 'redacted_value'}
+        task.runner_callback.host_map = {'myhost': 42}
         task.runner_callback.update_model = mock.Mock(wraps=update_model_wrapper)
         runner_config = MockMe()
         runner_config.command = {'foo': 'bar'}
@@ -512,7 +513,10 @@ class TestGenericRun:
         task.runner_callback.status_handler({'status': 'starting'}, runner_config)
 
         task.runner_callback.update_model.assert_called_with(
-            1, job_args=json.dumps({'foo': 'bar'}), job_cwd='/foobar', job_env={'switch': 'blade', 'foot': 'ball', 'secret_key': 'redacted_value'}
+            1,
+            job_args=json.dumps({'foo': 'bar'}),
+            job_cwd='/foobar',
+            job_env={'switch': 'blade', 'foot': 'ball', 'secret_key': 'redacted_value', 'host_map': {'myhost': 42}},
         )
 
     def test_created_by_extra_vars(self, mock_me):

@@ -1186,6 +1186,34 @@ def test_populate_host_map_from_inventory_resolves_real_hosts(me_inst):
 
 
 @pytest.mark.django_db
+def test_populate_host_map_from_inventory_prefers_job_env_snapshot(me_inst):
+    """If job_env already carries a host_map snapshot from job start, adoption must use it
+
+    instead of re-querying the current inventory, so a host deleted or disabled while the
+    job was orphaned still replays with the id it had when the job started.
+    """
+    from awx.main.tasks.callback import RunnerCallback
+    from awx.main.models import Organization, Inventory, Host
+
+    org = Organization.objects.first()
+    inv = Inventory.objects.create(name='cb-hostmap-snapshot-inv', organization=org)
+    Host.objects.create(name='myhost', inventory=inv)
+    job = Job.objects.create(
+        controller_node=me_inst.hostname,
+        status='running',
+        work_unit_id='unit-hm-snap',
+        inventory=inv,
+        job_env={'host_map': {'myhost': 999, 'deleted-host': 111}},
+    )
+
+    cb = RunnerCallback(model=Job)
+    cb.populate_host_map_from_inventory(job)
+
+    # 999 is not host.id: proves the snapshot won, not a live requery.
+    assert cb.host_map == {'myhost': 999, 'deleted-host': 111}
+
+
+@pytest.mark.django_db
 def test_compute_adoption_dedup_no_events(me_inst):
     """_compute_adoption_dedup returns (0, set()) when job has no events in DB."""
     from awx.main.tasks.receptor import _compute_adoption_dedup

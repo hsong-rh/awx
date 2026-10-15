@@ -126,16 +126,18 @@ def check_host_ids_match_job_start(job):
     """Every event and host summary should carry the host ids the job started with.
 
     A normal run builds its hostname-to-id map once, when it writes the inventory, and
-    records a copy (failpoints.record_snapshot). Adoption rebuilds the map from the live
-    inventory, so an inventory change during the orphan window re-points replayed events and
-    summaries. Expected, per host in the job-start map:
+    RunnerCallback.status_handler persists a copy in job_env (AAP-96843). Adoption prefers
+    that snapshot; without it (job started before this fix, or job_env lost it some other
+    way) adoption rebuilds the map from the live inventory, so an inventory change during the
+    orphan window re-points replayed events and summaries. Expected, per host in the
+    job-start map:
 
     - events: exactly the job-start id;
     - summaries: the job-start id if that host still exists, else None (a normal run nulls
       ids of hosts deleted before the stats event, and the foreign key nulls them after).
 
-    Without a snapshot (failpoints were off at job start) it falls back to consistency: one
-    host id per host name across all events.
+    Without a snapshot (job predates AAP-96843, or job_env lost it) it falls back to
+    consistency: one host id per host name across all events.
     """
     if not hasattr(job, 'job_host_summaries'):
         return {'name': 'host_ids_match_job_start', 'ok': True, 'detail': 'not applicable'}
@@ -144,7 +146,7 @@ def check_host_ids_match_job_start(job):
     for name, host_id in pairs:
         seen.setdefault(name, set()).add(host_id)
 
-    snapshot = get_snapshot('host_map', job.id)
+    snapshot = (job.job_env or {}).get('host_map')
     if snapshot is None:
         mixed = sorted(name for name, ids in seen.items() if len(ids) > 1)
         return {

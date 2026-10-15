@@ -71,16 +71,34 @@ def host_events(hostnames):
     return events
 
 
-@pytest.mark.xfail(strict=True, reason='AAP-96843: replayed events link to the wrong hosts after an inventory change')
+@pytest.mark.parametrize('original_controller', [None, PEER], ids=['same-node-resume', 'cross-controller-claim'])
 @pytest.mark.django_db
-def test_replayed_events_keep_the_host_ids_the_job_started_with(me_inst, inventory):
+def test_replayed_events_keep_the_host_ids_the_job_started_with(me_inst, inventory, original_controller):
     # 5.2 Host map after an inventory change. A normal run maps each host name to the id
-    # it had when the job started. Adoption rebuilds the map from the inventory as it is
-    # now, so after a change while the job was orphaned, replayed events lose the deleted
-    # and disabled hosts and point a recreated host at its new id.
+    # it had when the job started and persists that snapshot in job_env (status_handler's
+    # 'starting' branch, before this controller could ever die). Adoption must replay from
+    # that snapshot instead of rebuilding the map from the inventory as it is now, or a
+    # change while the job was orphaned loses the deleted and disabled hosts and points a
+    # recreated host at its new id.
+    #
+    # AAP-96843's own report was a same-node resume (the controller that started the job
+    # comes back and adopts its own orphan). reattach_to_work_unit is one function shared by
+    # every adoption path, so the cross-controller claim is covered here too, to document
+    # that the fix is not specific to either.
     hosts = {name: inventory.hosts.create(name=name) for name in ('fp-h1', 'fp-h2', 'fp-h3', 'fp-h4', 'fp-h5')}
     ids_at_start = {name: host.id for name, host in hosts.items()}
-    job = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id=UNIT, inventory=inventory)
+    job = Job.objects.create(
+        controller_node=original_controller or me_inst.hostname,
+        status='running',
+        work_unit_id=UNIT,
+        inventory=inventory,
+        job_env={'host_map': dict(ids_at_start)},
+    )
+    if original_controller:
+        # The claim a peer controller makes before publishing adopt_job_async: controller_node
+        # is rewritten to the claiming node before adopt_job ever runs.
+        job.controller_node = me_inst.hostname
+        job.save(update_fields=['controller_node'])
 
     # While the job is orphaned: delete fp-h2, recreate fp-h3, disable fp-h4.
     hosts['fp-h2'].delete()
