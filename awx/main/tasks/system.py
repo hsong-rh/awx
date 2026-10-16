@@ -1100,6 +1100,9 @@ def _process_running_jobs(this_inst, active_task_ids, ref_time):
             action = running_job_action(j, this_inst.hostname, active_task_ids, ref_time, workflow_ctype_id, live_controllers)
             if action == JobAction.ADOPT:
                 _dispatch_adoption(j)
+            elif action == JobAction.REQUEUE:
+                if UnifiedJob.objects.filter(pk=j.id, status='running').update(status='pending', controller_node='', execution_node=''):
+                    logger.warning(f'Job {j.id} had no work unit and no dispatcher task; reset to pending for re-dispatch')
             elif action == JobAction.REAP:
                 reaper.reap_job(j, 'failed')
         except Exception:

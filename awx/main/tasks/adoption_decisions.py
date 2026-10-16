@@ -181,9 +181,9 @@ def running_job_action(job, this_hostname, active_task_ids, ref_time, workflow_c
     A job is left alone unless it is running, belongs to this instance as controller or
     execution node, is not a workflow, started before ref_time, and no dispatcher task is
     tracking it. Such an orphan is adopted when this instance controls it and it was
-    dispatched to receptor. One that another instance controls is left alone too: a live
-    controller handles its own jobs, and a dispatched job of a dead controller is the orphan
-    sweep's to adopt. Anything else is reaped.
+    dispatched to receptor, and put back to pending when it never got a work unit. One that
+    another instance controls is left alone too: a live controller handles its own jobs, and a
+    dispatched job of a dead controller is the orphan sweep's to adopt. Anything else is reaped.
     """
     if job.status != 'running':
         return JobAction.SKIP
@@ -197,6 +197,10 @@ def running_job_action(job, this_hostname, active_task_ids, ref_time, workflow_c
         return JobAction.SKIP
     if job.work_unit_id and job.controller_node == this_hostname:
         return JobAction.ADOPT
+    if not job.work_unit_id and job.controller_node == this_hostname and not getattr(job, 'cancel_flag', False):
+        # Claimed by this controller but never given a work unit, e.g. it was swept from a killed
+        # controller before dispatch got that far. Nothing reached an EE, so run it again.
+        return JobAction.REQUEUE
     if job.controller_node != this_hostname and (job.controller_node in live_controller_hostnames or job.work_unit_id):
         return JobAction.SKIP
     return JobAction.REAP

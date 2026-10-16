@@ -282,8 +282,15 @@ class TestRunningJobAction:
     def test_job_a_dispatcher_task_still_tracks_is_left_alone(self):
         assert self.decide(make_job(celery_task_id='task-1'), active_task_ids=['task-1']) == JobAction.SKIP
 
-    def test_orphan_not_yet_dispatched_to_receptor_is_reaped(self):
-        assert self.decide(make_job(work_unit_id='')) == JobAction.REAP
+    def test_orphan_with_cancel_requested_and_no_work_unit_is_reaped(self):
+        # A user cancel must not be undone by putting the job back in the queue.
+        assert self.decide(make_job(work_unit_id='', cancel_flag=True)) == JobAction.REAP
+
+    @pytest.mark.parametrize('work_unit_id', ['', None])
+    def test_running_orphan_that_never_got_a_work_unit_is_requeued(self, work_unit_id):
+        # It was claimed during a controller kill, before any work unit existed, so nothing
+        # reached an execution environment and a re-dispatch cannot collide with partial work.
+        assert self.decide(make_job(work_unit_id=work_unit_id, execution_node='')) == JobAction.REQUEUE
 
     def test_orphan_this_instance_only_executes_is_left_to_the_sweep(self):
         # A dispatched job this instance only executes, for a controller that isn't live: this
