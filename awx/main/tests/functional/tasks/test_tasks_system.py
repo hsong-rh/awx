@@ -1020,12 +1020,32 @@ def test_process_running_jobs_adopts_dispatched_skips_active(me_inst):
 
 
 @pytest.mark.django_db
-def test_process_running_jobs_reaps_undispatched(me_inst):
-    """_process_running_jobs() reaps undispatched orphaned jobs."""
-    undispatched = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id=None, celery_task_id='orphan-undispatched')
+def test_process_running_jobs_reaps_undispatched_with_cancel_requested(me_inst):
+    """_process_running_jobs() reaps an undispatched orphan whose cancel was requested."""
+    undispatched = Job.objects.create(
+        controller_node=me_inst.hostname, status='running', work_unit_id=None, celery_task_id='orphan-undispatched', cancel_flag=True
+    )
     _process_running_jobs(me_inst, active_task_ids=set(), ref_time=None)
     undispatched.refresh_from_db()
     assert undispatched.status == 'failed', 'undispatched orphaned job should be reaped'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('work_unit_id', ['', None])
+def test_process_running_jobs_requeues_running_job_without_work_unit(me_inst, work_unit_id):
+    """A running job that never got a work unit goes back to pending instead of failing."""
+    job = Job.objects.create(
+        controller_node=me_inst.hostname,
+        status='running',
+        started=now() - timedelta(minutes=2),
+        work_unit_id=work_unit_id,
+        celery_task_id='orphan-no-unit',
+    )
+    _process_running_jobs(me_inst, active_task_ids=set(), ref_time=None)
+    job.refresh_from_db()
+    assert job.status == 'pending'
+    assert job.controller_node == ''
+    assert job.execution_node == ''
 
 
 @pytest.mark.django_db
