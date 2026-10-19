@@ -200,3 +200,19 @@ def test_pause_survives_a_database_restart():
         failpoints._pause('adoption.before_finalize', {'timeout': 60})
     assert close.call_count == 1
     assert cursor.calls == 2
+
+
+def test_trigger_returns_true_and_does_nothing_else(settings):
+    settings.AWX_FAILPOINTS_ENABLED = True
+    with _arm_in_memory({'heartbeat.force_lost': {}}), mock.patch.object(failpoints, '_record_hit', return_value=('trigger', {})):
+        assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is True
+
+
+def test_failpoint_returns_none_when_it_did_not_fire(settings):
+    settings.AWX_FAILPOINTS_ENABLED = True
+    with _arm_in_memory({}):
+        assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None
+    with _arm_in_memory({'heartbeat.force_lost': {}}), mock.patch.object(failpoints, '_record_hit', return_value=None):
+        assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None
+    settings.AWX_FAILPOINTS_ENABLED = False
+    assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None

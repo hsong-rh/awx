@@ -20,6 +20,8 @@ Actions:
             a specific type (e.g. redis.exceptions.ConnectionError) the call site handles
     kill    SIGKILL the current process
     kill_parent  SIGKILL the parent process (for a dispatcher worker, the dispatcher)
+    trigger  do nothing itself: the failpoint() call returns True, and a call site that asks
+            (``if failpoint(...):``) takes its own forced branch
 
 Matching:
     ``--match key=value`` must equal the call's context (all values compared as strings).
@@ -68,7 +70,7 @@ REGISTRY = {
     'adoption.before_task_id_saved': 'claim_for_adoption: the new celery_task_id is chosen, before the claim UPDATE writes it (a cancel here is addressed to the old owner).',
 }
 
-ACTIONS = ('pause', 'sleep', 'raise', 'kill', 'kill_parent')
+ACTIONS = ('pause', 'sleep', 'raise', 'kill', 'kill_parent', 'trigger')
 
 TABLE = 'awx_failpoint'
 HIT_TABLE = 'awx_failpoint_hit'
@@ -246,7 +248,11 @@ def _exception_class(path):
 
 
 def failpoint(name, **ctx):
-    """Mark a spot where a test may inject a fault. Inert unless enabled and armed."""
+    """Mark a spot where a test may inject a fault. Inert unless enabled and armed.
+
+    Returns True when the failpoint fired and did not raise or kill, so a call site can
+    take a forced branch (``if failpoint(...):``); otherwise None.
+    """
     if not enabled():
         return
     if name not in REGISTRY:
@@ -280,6 +286,7 @@ def failpoint(name, **ctx):
         os.kill(os.getpid(), signal.SIGKILL)
     elif action == 'kill_parent':
         os.kill(os.getppid(), signal.SIGKILL)
+    return True
 
 
 def record_snapshot(kind, key, data):
