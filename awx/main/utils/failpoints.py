@@ -67,6 +67,7 @@ REGISTRY = {
     'sweep.before_claim': 'Orphan sweep: capacity available, before the claim UPDATE.',
     'adoption.before_adoption_published': '_publish_adoption: the adoption task id is on the job, the task not yet published (a cancel here reaches no worker).',
     'adoption.after_claim': 'adopt_job_async: job claimed for this controller, before the capacity check and streaming.',
+    'heartbeat.force_lost': 'Per peer in _heartbeat_instance_management (ctx: other). A fired trigger makes this heartbeat judge that peer lost, whatever its last_seen and its place on the mesh.',
     'adoption.before_task_id_saved': 'claim_for_adoption: the new celery_task_id is chosen, before the claim UPDATE writes it (a cancel here is addressed to the old owner).',
 }
 

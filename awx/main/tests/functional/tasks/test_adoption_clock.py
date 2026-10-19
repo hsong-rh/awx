@@ -50,6 +50,29 @@ def lost_hostnames(clock):
     return sorted(inst.hostname for inst in lost)
 
 
+@pytest.mark.django_db
+def test_force_lost_failpoint_judges_a_fresh_peer_on_the_mesh_lost(heartbeat_settings):
+    t = now()
+    control_node('ctrl-0', t)
+    control_node('ctrl-1', t)
+    ctl = mock.MagicMock()
+    # ctrl-1 is fresh and connected, so only the failpoint can make it lost.
+    ctl.simple_command.return_value = {'KnownConnectionCosts': {'ctrl-0': {'ctrl-1': 1}, 'ctrl-1': {'ctrl-0': 1}}, 'Advertisements': []}
+
+    def fired(name, **ctx):
+        return name == 'heartbeat.force_lost' and ctx['other'] == 'ctrl-1'
+
+    with (
+        mock.patch('awx.main.tasks.system.get_receptor_ctl', return_value=ctl),
+        mock.patch('awx.main.tasks.system.inspect_execution_and_hop_nodes'),
+        mock.patch('awx.main.tasks.system.failpoint', side_effect=fired),
+        mock.patch.object(Instance, 'local_health_check'),
+    ):
+        _, remaining, lost, _ = _heartbeat_instance_management(FakeClock(t))
+    assert [inst.hostname for inst in lost] == ['ctrl-1']
+    assert 'ctrl-1' not in [inst.hostname for inst in remaining]
+
+
 # ── Clock skew between controllers ───────────────────────────────────────────
 
 
