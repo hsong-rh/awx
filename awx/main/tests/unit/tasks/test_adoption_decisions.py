@@ -240,6 +240,10 @@ class TestMeshHostnames:
         status = {'KnownConnectionCosts': {ME: {PEER: 1, EXEC: 1}, PEER: {ME: 1}}}
         assert mesh_hostnames(status) == {ME, PEER, EXEC}
 
+    def test_node_that_left_the_mesh_stays_in_the_table_without_connections(self):
+        status = {'KnownConnectionCosts': {ME: {EXEC: 1}, PEER: {}, EXEC: {ME: 1}}}
+        assert mesh_hostnames(status) == {ME, EXEC}
+
     @pytest.mark.parametrize('status', [{}, {'KnownConnectionCosts': None}, {'KnownConnectionCosts': {}}])
     def test_empty_routing_table_puts_no_one_on_the_mesh(self, status):
         assert mesh_hostnames(status) == set()

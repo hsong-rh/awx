@@ -68,11 +68,17 @@ def live_controller_hostnames(instances, ref_time, grace_seconds, mesh_hostnames
 
 
 def mesh_hostnames(mesh_status):
-    """The nodes receptor's routing table names, from its status: every node with a known route."""
+    """The nodes receptor's routing table names, from its status: every node with a known route.
+
+    A node that left the mesh stays in the table as a key with no connections, so a key counts
+    only if it has some.
+    """
     costs = (mesh_status or {}).get('KnownConnectionCosts') or {}
-    names = set(costs)
-    for peers in costs.values():
-        names.update(peers or {})
+    names = set()
+    for node, peers in costs.items():
+        if peers:
+            names.add(node)
+            names.update(peers)
     return names
 
 
