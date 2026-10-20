@@ -957,7 +957,8 @@ class AWXReceptorJob:
             # work unit so Receptor does not race the unit-directory removal.
             self._close_results(resultsock, resultfile)
 
-        if res.status == 'error' and not self.detached:
+        # _await_processor returns None when it abandons a stream whose processor thread will not exit
+        if res is not None and res.status == 'error' and not self.detached:
             return self._handle_work_error(work, res)
 
         return res
