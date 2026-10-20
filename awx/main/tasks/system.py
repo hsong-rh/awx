@@ -955,8 +955,10 @@ def _handle_lost_instance_job(j, other_inst):
         _publish_adoption(j.id, task_id)
         logger.info(f'Cross-controller adoption queued for job {j.id} (unit={j.work_unit_id}) from lost controller {other_inst.hostname}')
     except Exception:
-        logger.exception(f'Failed to queue cross-controller adoption for job {j.id}, reaping instead')
-        reaper.reap_job(j, 'failed', job_explanation='Job reaped due to instance shutdown')
+        # The playbook is still running on its EE, so failing the job would orphan it. Give it back
+        # to the dead controller: that is the orphan sweep's predicate, so a later heartbeat retries.
+        logger.exception(f'Failed to queue cross-controller adoption for job {j.id}, handing it back to {j.controller_node} for the orphan sweep')
+        release_claim(j, task_id)
 
 
 def _reap_and_mark_lost_instance(other_inst):
@@ -967,7 +969,11 @@ def _reap_and_mark_lost_instance(other_inst):
             UnifiedJob.objects.filter(
                 Q(execution_node=other_inst.hostname) | Q(controller_node=other_inst.hostname),
                 status='running',
-            ).exclude(polymorphic_ctype_id=workflow_ctype_id)
+            )
+            .exclude(polymorphic_ctype_id=workflow_ctype_id)
+            # A job this node controls has its own run or adoption task, which times out a lost EE
+            # itself; reaping it here killed a claimed adoption that was waiting for the route back.
+            .exclude(controller_node=settings.CLUSTER_HOST_ID)
         )
         for j in running_jobs:
             _handle_lost_instance_job(j, other_inst)
@@ -1132,6 +1138,13 @@ def claim_for_adoption(job, new_controller=None):
     failpoint('adoption.before_task_id_saved', job_id=job.id, task_id=task_id)
     claimed = UnifiedJob.objects.filter(pk=job.id, status='running', controller_node=job.controller_node, celery_task_id=job.celery_task_id).update(**updates)
     return task_id if claimed else None
+
+
+def release_claim(job, task_id):
+    """Undo claim_for_adoption: restore the owner and task id the caller read, if no one has claimed the job since."""
+    return UnifiedJob.objects.filter(pk=job.id, controller_node=settings.CLUSTER_HOST_ID, celery_task_id=task_id).update(
+        controller_node=job.controller_node, celery_task_id=job.celery_task_id
+    )
 
 
 def _publish_adoption(job_id, task_id):
