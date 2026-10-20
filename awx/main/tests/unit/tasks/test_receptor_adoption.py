@@ -1803,6 +1803,37 @@ def test_stream_is_stalled_false_when_status_query_raises():
     assert rj._stream_is_stalled(ReceptorWork(ctl), _stalling_reader()) is False
 
 
+def test_stream_is_stalled_true_when_idle_and_the_execution_node_has_no_route():
+    """A running unit on a cut-off node: the local receptor cannot tell us it is gone."""
+    rj = _make_receptor_job()
+    rj.stream_idle_timeout = 120
+    rj.route_lost = lambda: True
+    ctl = Mock()
+    ctl.simple_command.return_value = {'StateName': 'Running', 'StdoutSize': 5000}
+
+    assert rj._stream_is_stalled(ReceptorWork(ctl), _stalling_reader(bytes_read=10)) is True
+    assert rj.stream_cut_off is True
+
+
+def test_stream_is_stalled_false_when_idle_but_the_route_exists():
+    rj = _make_receptor_job()
+    rj.stream_idle_timeout = 120
+    rj.route_lost = lambda: False
+    ctl = Mock()
+    ctl.simple_command.return_value = {'StateName': 'Running', 'StdoutSize': 5000}
+
+    assert rj._stream_is_stalled(ReceptorWork(ctl), _stalling_reader(bytes_read=10)) is False
+    assert rj.stream_cut_off is False
+
+
+def test_stream_is_stalled_ignores_the_route_while_data_flows():
+    rj = _make_receptor_job()
+    rj.stream_idle_timeout = 120
+    rj.route_lost = lambda: True
+
+    assert rj._stream_is_stalled(ReceptorWork(Mock()), _stalling_reader(bytes_read=10, idle_for=5)) is False
+
+
 def test_stream_is_stalled_true_on_terminal_idle_short_read():
     """The real bug: Succeeded with StdoutSize 194807 and nothing delivered locally."""
     rj = _make_receptor_job()

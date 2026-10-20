@@ -45,7 +45,8 @@ from awx.main.tasks.signals import signal_state, signal_callback, SignalExit
 from awx.main.tasks.callback import RunnerCallback
 from awx.main.utils.update_model import NotOwner
 from awx.main.tasks.adoption import invoke_adoption_hooks
-from awx.main.tasks.adoption_decisions import stall_budget_exhausted
+from awx.main.tasks.adoption_decisions import stall_budget_exhausted, execution_node_reachable, routed_hostnames
+from awx.main.dispatch import reaper
 from awx.main.models import Instance, InstanceLink, UnifiedJob, ReceptorAddress
 from awx.main.dispatch import get_task_queuename
 
@@ -591,6 +592,16 @@ class AWXReceptorJob:
     # retrying later and finalizing from the work unit status.
     stream_stalled = False
 
+    # Set together with stream_stalled when the stream sat idle and this node has no route to
+    # the execution node. The unit is not terminal then — the local receptor answers for its
+    # cached copy — so the caller cannot finalize from the unit status the way it can for a
+    # terminal one and has to decide about the job itself.
+    stream_cut_off = False
+
+    # Returns True when this node has no route to the execution node. Only adoption sets it,
+    # for the same reason as stream_idle_timeout.
+    route_lost = None
+
     # How often to re-check a stream that has not finished yet.
     STREAM_POLL_INTERVAL = 10
 
@@ -734,6 +745,12 @@ class AWXReceptorJob:
         """
         if time.monotonic() - reader.last_progress < self.stream_idle_timeout:
             return False
+        # An idle stream does not say whether the job is quiet or cut off, the route does.
+        # The unit status cannot: with the execution node unreachable the local receptor
+        # answers from its cached copy.
+        if self.route_lost is not None and self.route_lost():
+            self.stream_cut_off = True
+            return True
         try:
             unit_status = work.status(self.unit_id)
         except Exception:
@@ -1599,6 +1616,15 @@ def _finalize_adoption_result(job, callback, res, process_phase_failed, work, un
     return True
 
 
+def _no_route_to(execution_node, work):
+    """True when receptor's routing table is readable and has no entry for the execution node."""
+    try:
+        status = work.receptor_ctl.simple_command('status')
+    except Exception:
+        return False
+    return not execution_node_reachable(execution_node, routed_hostnames(status))
+
+
 def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status=None, pod_name=None):
     """Reconnect to a receptor work unit and stream events in real-time until it completes.
 
@@ -1675,6 +1701,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
     receptor_job = AWXReceptorJob(adoption_task, {'private_data_dir': private_data_dir, 'ident': job.id})
     receptor_job.unit_id = unit_id
     receptor_job.stream_idle_timeout = settings.HADR_ADOPTION_STREAM_IDLE_TIMEOUT
+    receptor_job.route_lost = lambda: _no_route_to(job.execution_node, work)
 
     process_phase_failed = False
     res = None
@@ -1703,6 +1730,20 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
             logger.info(f'Job {job.id}: results stream for unit {unit_id} stalled, deferring adoption for retry on next heartbeat')
             shutil.rmtree(private_data_dir, ignore_errors=True)
             return False
+
+        if receptor_job.stream_cut_off:
+            # Cut off from the execution node for the whole budget: there is no unit status to
+            # finalize from, and the same wait already fails a unit that cannot be queried.
+            logger.error(f'Job {job.id}: no route to {job.execution_node} for >{settings.HADR_JOB_ADOPTION_TIMEOUT}s, failing')
+            try:
+                work.cancel(unit_id)
+            except Exception as exc:
+                logger.warning(f'Failed to cancel work unit {unit_id} while timing out job {job.id}: {exc}')
+            reaper.reap_job(
+                job, 'failed', job_explanation='Job exceeded HADR_JOB_ADOPTION_TIMEOUT: the execution node was unreachable (no route from the controller)'
+            )
+            shutil.rmtree(private_data_dir, ignore_errors=True)
+            return True
 
         # Budget spent. The work unit status is the only truthful source left: the
         # truncated stream reads as an error, which would record a job that actually
