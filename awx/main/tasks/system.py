@@ -76,10 +76,12 @@ from awx.main.tasks.adoption_decisions import (
     JobAction,
     LostInstanceAction,
     adoption_slot_available,
+    execution_node_reachable,
     find_lost_instances,
     gate_lost_instances,
     live_controller_hostnames,
     mesh_hostnames,
+    routed_hostnames,
     room_for_another_controllers_job,
     lost_instance_disposition,
     lost_instance_job_action,
@@ -923,10 +925,17 @@ def _handle_lost_instance_job(j, other_inst):
     # by our caller, so a peer picks it up on its next heartbeat. Claim first and the job is
     # ours for good: a claim sets controller_node to a live node, and the sweep never steals
     # from a live node, which is how one pod used to end up with every job.
-    action = lost_instance_job_action(j, other_inst.hostname, lambda: _room_for_another_controllers_job(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT))
+    action = lost_instance_job_action(
+        j,
+        other_inst.hostname,
+        lambda: _room_for_another_controllers_job(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT),
+        lambda: execution_node_reachable(j.execution_node, _receptor_routed_hostnames()),
+    )
 
     if action == JobAction.DEFER:
-        logger.info(f'Cross-controller adoption deferred for job {j.id}: no control capacity here, leaving it for another controller to sweep')
+        logger.info(
+            f'Cross-controller adoption deferred for job {j.id}: no control capacity or no route to {j.execution_node} here, leaving it for another controller to sweep'
+        )
         return
 
     if action == JobAction.REQUEUE:
@@ -961,6 +970,13 @@ def _handle_lost_instance_job(j, other_inst):
         release_claim(j, task_id)
 
 
+def _live_controller_hostnames(clock=None):
+    """The controllers the orphan sweep would leave alone, judged on the instance rows alone."""
+    grace_seconds = settings.CLUSTER_NODE_HEARTBEAT_PERIOD * settings.CLUSTER_NODE_MISSED_HEARTBEAT_TOLERANCE
+    instances = list(Instance.objects.only('hostname', 'node_state', 'last_seen'))
+    return live_controller_hostnames(instances, (clock or now)(), grace_seconds)
+
+
 def _reap_and_mark_lost_instance(other_inst):
     """Reap a lost instance's running jobs and mark it offline (or deprovision it)."""
     try:
@@ -975,7 +991,17 @@ def _reap_and_mark_lost_instance(other_inst):
             # itself; reaping it here killed a claimed adoption that was waiting for the route back.
             .exclude(controller_node=settings.CLUSTER_HOST_ID)
         )
+        live_controllers = _live_controller_hostnames()
         for j in running_jobs:
+            # A dead controller's dispatched job on a lost EE is the orphan sweep's: it claims the job
+            # from a node that has a route, or from any node once HADR_JOB_ADOPTION_TIMEOUT has passed
+            # without one. This node may only have lost its own route, so reaping here killed a
+            # running playbook (3.9).
+            if j.controller_node not in (other_inst.hostname, '') and j.controller_node not in live_controllers:
+                logger.info(
+                    f'Job {j.id} on lost execution node {other_inst.hostname}: controller {j.controller_node} is not live, leaving it to the orphan sweep'
+                )
+                continue
             _handle_lost_instance_job(j, other_inst)
         # Any jobs that were waiting to be processed by this node will be handed back to task manager
         UnifiedJob.objects.filter(status='waiting', controller_node=other_inst.hostname).update(status='pending', controller_node='', execution_node='')
@@ -1165,7 +1191,7 @@ def _dispatch_adoption(job, new_controller=None):
     return task_id
 
 
-def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None):
+def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None, route_lookup=None):
     """Adopt running jobs whose controller is no longer a live instance.
 
     The lost-instance path is one-shot and winner-takes-all: the pod that wins
@@ -1216,9 +1242,10 @@ def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None):
         .exclude(execution_node=F('controller_node'))
         .exclude(polymorphic_ctype_id=workflow_ctype_id)
         .order_by('started')  # longest-stranded first: they are closest to their deadline
-        .values_list('id', 'controller_node', 'celery_task_id', named=True)[: settings.HADR_ORPHAN_SWEEP_MAX_PER_HEARTBEAT]
+        .values_list('id', 'controller_node', 'celery_task_id', 'execution_node', 'work_unit_id', named=True)[: settings.HADR_ORPHAN_SWEEP_MAX_PER_HEARTBEAT]
     )
     orphans = _exclude_live_controllers_without_rows(list(orphans), instances, ref_time, grace_seconds, mesh_lookup or _receptor_mesh_hostnames)
+    orphans = _exclude_unreachable_execution_nodes(orphans, route_lookup or _receptor_routed_hostnames, clock)
 
     swept = 0
     for orphan in orphans:
@@ -1261,8 +1288,39 @@ def _exclude_live_controllers_without_rows(orphans, instances, ref_time, grace_s
     return [orphan for orphan in orphans if orphan.controller_node not in live]
 
 
-def _receptor_mesh_hostnames():
-    """The nodes on the receptor mesh as this node sees it, or None when receptor cannot be read."""
+def _exclude_unreachable_execution_nodes(orphans, route_lookup, clock=None):
+    """Drop the orphans whose execution node this node has no route to, for HADR_JOB_ADOPTION_TIMEOUT.
+
+    A claim made without a route leaves the job running on a stream that cannot open, and the
+    claim keeps every other controller that does have a route from adopting it. Left
+    unclaimed it stays the dead controller's, so a node with a route sweeps it. If none
+    does, past the timeout this node claims it anyway, so the job is not left with no owner.
+    The clock is the 'unreachable' stall clock adoption uses; it is cleared once a route exists.
+    The routing table is only read when there is something to adopt.
+
+    shortcut: only the wait before the claim is bounded. A claimed job whose local receptor
+    still answers for the unit streams until the link returns, so a job whose controller and
+    execution node are both permanently dead stays running until someone cancels it.
+    Upgrade when the adoption stream gets its own idle bound.
+    """
+    if not orphans:
+        return orphans
+    routed = route_lookup()
+    kept = []
+    for orphan in orphans:
+        if execution_node_reachable(orphan.execution_node, routed):
+            if orphan.execution_node:
+                clear_adoption_stall(orphan, 'unreachable')  # only .id and .work_unit_id build the key
+            kept.append(orphan)
+        elif _adoption_stall_budget_exhausted(UnifiedJob.objects.get(pk=orphan.id), 'unreachable', clock=clock):
+            kept.append(orphan)
+        else:
+            logger.info(f'Orphan sweep skipping job {orphan.id}: no route to {orphan.execution_node} from here')
+    return kept
+
+
+def _read_receptor_status(parse):
+    """parse(receptor's status) as this node sees it, or None when receptor cannot be read."""
     try:
         ctl = get_receptor_ctl()
     except FileNotFoundError:
@@ -1274,7 +1332,17 @@ def _receptor_mesh_hostnames():
             ctl.close()
         except Exception:
             pass
-    return None if status is None else mesh_hostnames(status)
+    return None if status is None else parse(status)
+
+
+def _receptor_mesh_hostnames():
+    """The nodes on the receptor mesh as this node sees it, or None when receptor cannot be read."""
+    return _read_receptor_status(mesh_hostnames)
+
+
+def _receptor_routed_hostnames():
+    """The nodes this node has a route to, or None when receptor cannot be read."""
+    return _read_receptor_status(routed_hostnames)
 
 
 def _current_namespace():

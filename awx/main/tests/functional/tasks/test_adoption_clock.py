@@ -12,6 +12,7 @@ from django.utils.timezone import now, timedelta
 
 from awx.main.models import Instance, Job, JobEvent
 from awx.main.tasks import system
+from awx.main.tasks.receptor import _adoption_stall_key
 from awx.main.tasks.system import _heartbeat_instance_management, _sweep_orphaned_jobs, adopt_job, run_heartbeat
 from awx.main.tests.fake_clock import FakeClock
 from awx.main.tests.fake_receptor import FakeReceptorWork, FakeWorkUnit, RecordingDispatcher, make_events
@@ -264,6 +265,57 @@ def test_sweep_takes_jobs_of_a_controller_unavailable_past_the_grace_period(hear
     publish.assert_called_once()
     job.refresh_from_db()
     assert job.controller_node == 'ctrl-0'
+
+
+@pytest.mark.django_db
+def test_sweep_waits_for_a_node_with_a_route_but_only_for_the_adoption_timeout(heartbeat_settings, me_inst):
+    """A node with no route to the execution node leaves the job to a peer that has one, but not
+    forever: past HADR_JOB_ADOPTION_TIMEOUT it claims the job so it is not left with no owner (3.9)."""
+    cache.clear()
+    heartbeat_settings.HADR_JOB_ADOPTION_TIMEOUT = TIMEOUT
+    seen = now()
+    Instance.objects.create(hostname='ctrl-1', node_type='control', node_state='unavailable', last_seen=seen - timedelta(hours=1))
+    job = Job.objects.create(controller_node='ctrl-1', execution_node='receptor-1', status='running', work_unit_id=UNIT, started=seen)
+    clock = FakeClock(seen)
+    no_route = lambda: {'ctrl-0'}  # noqa: E731
+
+    with (
+        mock.patch('awx.main.tasks.system._adoption_slot_available', return_value=True),
+        mock.patch('awx.main.tasks.system._publish_adoption') as publish,
+    ):
+        _sweep_orphaned_jobs(me_inst, clock=clock, route_lookup=no_route)
+        publish.assert_not_called()
+        assert cache.get(_adoption_stall_key(job, 'unreachable')) is not None, 'the wait is timed'
+
+        clock.advance(TIMEOUT + 1)
+        _sweep_orphaned_jobs(me_inst, clock=clock, route_lookup=no_route)
+
+    publish.assert_called_once()
+    job.refresh_from_db()
+    assert job.controller_node == 'ctrl-0'
+    cache.clear()
+
+
+@pytest.mark.django_db
+def test_sweep_clears_the_wait_once_a_route_exists(heartbeat_settings, me_inst):
+    cache.clear()
+    heartbeat_settings.HADR_JOB_ADOPTION_TIMEOUT = TIMEOUT
+    seen = now()
+    Instance.objects.create(hostname='ctrl-1', node_type='control', node_state='unavailable', last_seen=seen - timedelta(hours=1))
+    job = Job.objects.create(controller_node='ctrl-1', execution_node='receptor-1', status='running', work_unit_id=UNIT, started=seen)
+    clock = FakeClock(seen)
+
+    with (
+        mock.patch('awx.main.tasks.system._adoption_slot_available', return_value=True),
+        mock.patch('awx.main.tasks.system._publish_adoption') as publish,
+    ):
+        _sweep_orphaned_jobs(me_inst, clock=clock, route_lookup=lambda: {'ctrl-0'})
+        assert cache.get(_adoption_stall_key(job, 'unreachable')) is not None
+        _sweep_orphaned_jobs(me_inst, clock=clock, route_lookup=lambda: {'receptor-1'})
+
+    publish.assert_called_once()
+    assert cache.get(_adoption_stall_key(job, 'unreachable')) is None, 'a later cut gets a fresh budget'
+    cache.clear()
 
 
 @pytest.mark.django_db

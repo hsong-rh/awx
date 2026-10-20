@@ -82,6 +82,17 @@ def mesh_hostnames(mesh_status):
     return names
 
 
+def routed_hostnames(mesh_status):
+    """The nodes this node can reach right now: its routing table.
+
+    KnownConnectionCosts is the gossiped graph and keeps a cut-off node for a while after the
+    route is gone (gist 3.9: the sweep claimed 5 s after the route went), so reachability is
+    read from RoutingTable, the table receptor forwards by. None when the status has no table.
+    """
+    table = (mesh_status or {}).get('RoutingTable')
+    return None if table is None else set(table)
+
+
 def gate_lost_instances(lost_instances, mesh_ready):
     """Return the lost instances that may be handled now.
 
@@ -98,19 +109,28 @@ def gate_lost_instances(lost_instances, mesh_ready):
     return [inst for inst in lost_instances if inst.node_type in ('execution', 'hop')]
 
 
-def lost_instance_job_action(job, lost_hostname, slot_available):
+def execution_node_reachable(execution_node, routed):
+    """Does this node have a route to the job's execution node?
+
+    A container group job has no execution_node, and an unreadable routing table (None) says nothing,
+    so both count as reachable: the check only ever declines on positive evidence.
+    """
+    return not execution_node or routed is None or execution_node in routed
+
+
+def lost_instance_job_action(job, lost_hostname, slot_available, route_available=lambda: True):
     """What to do with a running job whose controller or execution node was lost.
 
     A job dispatched to receptor whose controller was lost is adopted if its playbook ran on
     another node, which outlived the controller. It is deferred instead when this controller
-    has no room: it stays owned by the lost controller, so another controller's orphan sweep
-    still finds it. A job that never reached an execution environment goes back to pending.
+    has no room or no route to its execution node: it stays owned by the lost controller, so
+    another controller's orphan sweep still finds it. A job that never reached an execution environment goes back to pending.
     Anything else is reaped.
 
-    slot_available is a callable, asked only for a job that would be adopted.
+    slot_available and route_available are callables, asked only for a job that would be adopted.
     """
     if job.work_unit_id and job.controller_node == lost_hostname and job.execution_node != lost_hostname:
-        return JobAction.ADOPT if slot_available() else JobAction.DEFER
+        return JobAction.ADOPT if route_available() and slot_available() else JobAction.DEFER
     if not job.started and not job.work_unit_id:
         return JobAction.REQUEUE
     return JobAction.REAP
