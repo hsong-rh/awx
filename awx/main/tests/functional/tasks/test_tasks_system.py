@@ -5,6 +5,7 @@ import os
 import tempfile
 import shutil
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,7 @@ from awx.main.tasks.system import (
     _heartbeat_instance_management,
     _process_startup_jobs,
     _process_running_jobs,
+    _exclude_unreachable_execution_nodes,
     _sweep_orphaned_jobs,
     _handle_lost_instance_job,
     _dispatch_adoption,
@@ -635,6 +637,7 @@ class TestReapAndMarkLostInstance:
         """A lost EE leaves the job's controller alive and still running it — reap, never adopt."""
         settings.AWX_AUTO_DEPROVISION_INSTANCES = False
         inst = self._inst(hostname='ee-lost', node_type='execution')
+        Instance.objects.create(hostname='live-ctrl', node_type='control', node_state='ready', last_seen=now())
         job = Job.objects.create(
             controller_node='live-ctrl',
             status='running',
@@ -651,6 +654,33 @@ class TestReapAndMarkLostInstance:
         job.refresh_from_db()
         assert job.controller_node == 'live-ctrl'
         assert job.celery_task_id == 'original-uuid'
+
+    def test_reap_leaves_a_dead_controllers_job_on_a_lost_execution_node_to_the_sweep(self, settings):
+        """A dead controller's dispatched job is the orphan sweep's, which claims it from a node with a
+        route. Reaping it here killed a playbook that was still running when only this node's link was cut (3.9)."""
+        settings.AWX_AUTO_DEPROVISION_INSTANCES = False
+        inst = self._inst(hostname='ee-lost', node_type='execution')
+        Instance.objects.create(hostname='dead-ctrl', node_type='control', node_state='unavailable', last_seen=now() - timedelta(hours=1))
+        job = Job.objects.create(
+            controller_node='dead-ctrl', status='running', work_unit_id='unit-abc', execution_node=inst.hostname, celery_task_id='original-uuid'
+        )
+        with mock.patch('awx.main.tasks.system.adopt_job_async'), mock.patch('awx.main.tasks.system.reaper') as mock_reaper:
+            _reap_and_mark_lost_instance(inst)
+
+        mock_reaper.reap_job.assert_not_called()
+        job.refresh_from_db()
+        assert (job.status, job.controller_node) == ('running', 'dead-ctrl')
+
+    def test_reap_leaves_a_job_whose_controller_has_no_instance_row_to_the_sweep(self, settings):
+        settings.AWX_AUTO_DEPROVISION_INSTANCES = False
+        inst = self._inst(hostname='ee-lost', node_type='execution')
+        job = Job.objects.create(controller_node='deprovisioned-ctrl', status='running', work_unit_id='unit-abc', execution_node=inst.hostname)
+        with mock.patch('awx.main.tasks.system.reaper') as mock_reaper:
+            _reap_and_mark_lost_instance(inst)
+
+        mock_reaper.reap_job.assert_not_called()
+        job.refresh_from_db()
+        assert job.status == 'running'
 
     def test_reap_does_not_adopt_when_lost_node_is_both_controller_and_execution_node(self, settings):
         """A lost hybrid node takes its work unit with it — there is nothing left to adopt."""
@@ -1548,6 +1578,25 @@ def test_lost_instance_job_not_marked_for_reaping_is_left_running(settings):
 
 
 @pytest.mark.django_db
+def test_lost_controllers_job_is_left_unclaimed_when_this_node_has_no_route_to_its_execution_node(settings):
+    settings.AWX_AUTO_DEPROVISION_INSTANCES = False
+    lost = Instance.objects.create(hostname='lost-node', node_type='control', node_state='ready')
+    job = Job.objects.create(controller_node='lost-node', execution_node='exec-cut', status='running', work_unit_id='unit-1')
+
+    with (
+        patch('awx.main.tasks.system._receptor_routed_hostnames', return_value={'lost-node'}),
+        patch('awx.main.tasks.system.claim_for_adoption') as claim,
+        patch('awx.main.tasks.system.reaper') as mock_reaper,
+    ):
+        _reap_and_mark_lost_instance(lost)
+
+    claim.assert_not_called()
+    mock_reaper.reap_job.assert_not_called()
+    job.refresh_from_db()
+    assert (job.status, job.controller_node) == ('running', 'lost-node')
+
+
+@pytest.mark.django_db
 def test_heartbeat_job_the_decision_skips_is_neither_adopted_nor_reaped(me_inst):
     job = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id='unit-1', started=now() - timedelta(minutes=1))
 
@@ -1654,6 +1703,19 @@ class TestOrphanSweep:
             patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=True),
         ):
             self.mesh = mesh
+            yield
+
+    @pytest.fixture
+    def real_route_check(self):
+        """Marks a test that wants the sweep's route check to run."""
+
+    @pytest.fixture(autouse=True)
+    def no_route_check(self, request):
+        """The sweep tests predate the route check and have no mesh to read; those that want it request real_route_check."""
+        if 'real_route_check' in request.fixturenames:
+            yield
+            return
+        with patch('awx.main.tasks.system._exclude_unreachable_execution_nodes', side_effect=lambda orphans, route_lookup, clock=None: orphans):
             yield
 
     def _orphan(self, controller_node='dead-controller', work_unit_id='unit-orphan', **kwargs):
@@ -1813,6 +1875,24 @@ class TestOrphanSweep:
             _sweep_orphaned_jobs(me_inst)
 
         room.assert_called_with(headroom_needed=django_settings.AWX_CONTROL_NODE_TASK_IMPACT)
+
+    def test_sweep_leaves_a_job_whose_execution_node_has_no_route_from_here(self, me_inst, real_route_check):
+        """A claim without a route parks a stream that cannot open, and keeps a controller that
+        does have a route from adopting the job (gist 3.9)."""
+        cut = self._orphan(work_unit_id='unit-cut', execution_node='exec-cut')
+        reachable = self._orphan(work_unit_id='unit-ok', execution_node='exec-ok')
+
+        with patch('awx.main.tasks.system._publish_adoption') as queue:
+            _sweep_orphaned_jobs(me_inst, route_lookup=lambda: {'exec-ok'})
+
+        assert Job.objects.get(pk=cut.pk).controller_node == 'dead-controller'
+        assert Job.objects.get(pk=reachable.pk).controller_node == me_inst.hostname
+        queue.assert_called_once()
+
+    def test_route_check_declines_nothing_when_the_mesh_cannot_be_read(self):
+        orphans = [SimpleNamespace(id=1, work_unit_id='u1', execution_node='exec-cut'), SimpleNamespace(id=2, work_unit_id='u2', execution_node='')]
+
+        assert _exclude_unreachable_execution_nodes(orphans, lambda: None) == orphans
 
     def test_oldest_jobs_are_swept_first(self, me_inst):
         """When capacity is short, the job that has been stranded longest is the one closest to

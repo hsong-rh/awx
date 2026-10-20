@@ -9,9 +9,11 @@ from awx.main.tasks.adoption_decisions import (
     JobAction,
     LostInstanceAction,
     adoption_slot_available,
+    execution_node_reachable,
     find_lost_instances,
     live_controller_hostnames,
     mesh_hostnames,
+    routed_hostnames,
     room_for_another_controllers_job,
     gate_lost_instances,
     lost_instance_disposition,
@@ -121,8 +123,8 @@ class TestGateLostInstances:
 
 
 class TestLostInstanceDecisions:
-    def decide(self, job, slot_available=True):
-        return lost_instance_job_action(job, PEER, lambda: slot_available)
+    def decide(self, job, slot_available=True, route_available=True):
+        return lost_instance_job_action(job, PEER, lambda: slot_available, lambda: route_available)
 
     def test_dispatched_job_of_a_lost_controller_is_adopted(self):
         assert self.decide(make_job(controller_node=PEER)) == JobAction.ADOPT
@@ -130,6 +132,22 @@ class TestLostInstanceDecisions:
     def test_adoptable_job_is_deferred_when_this_controller_has_no_room(self):
         # It stays owned by the lost controller, so another controller's orphan sweep finds it.
         assert self.decide(make_job(controller_node=PEER), slot_available=False) == JobAction.DEFER
+
+    def test_adoptable_job_is_deferred_when_this_node_has_no_route_to_its_execution_node(self):
+        assert self.decide(make_job(controller_node=PEER), route_available=False) == JobAction.DEFER
+
+    def test_routed_hostnames_reads_the_routing_table_not_the_gossiped_graph(self):
+        status = {'RoutingTable': {'awx-1': 'awx-1'}, 'KnownConnectionCosts': {'receptor-hop': {'receptor-1': 1}}}
+
+        assert routed_hostnames(status) == {'awx-1'}
+        assert routed_hostnames({}) is None
+
+    @pytest.mark.parametrize(
+        'execution_node, on_mesh, expected',
+        [('exec-1', {'exec-1'}, True), ('exec-1', {'other'}, False), ('exec-1', None, True), ('', {'other'}, True)],
+    )
+    def test_execution_node_reachable_declines_only_on_positive_evidence(self, execution_node, on_mesh, expected):
+        assert execution_node_reachable(execution_node, on_mesh) is expected
 
     def test_job_that_never_reached_an_execution_environment_goes_back_to_pending(self):
         assert self.decide(make_job(controller_node=PEER, work_unit_id='', started=None)) == JobAction.REQUEUE
