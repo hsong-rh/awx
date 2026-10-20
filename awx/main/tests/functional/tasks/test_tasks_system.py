@@ -576,6 +576,61 @@ class TestReapAndMarkLostInstance:
         adopted = mock_adopt.apply_async.call_args[1]['uuid']
         assert Job.objects.filter(controller_node=settings.CLUSTER_HOST_ID, celery_task_id=adopted).count() == 1
 
+    def test_failed_publish_hands_the_claimed_job_back_instead_of_reaping(self, settings):
+        """A publish that raises must not fail a job whose playbook is still running (3.2)."""
+        settings.AWX_AUTO_DEPROVISION_INSTANCES = False
+        inst = self._inst(hostname='ctrl-lost')
+        job = Job.objects.create(
+            controller_node=inst.hostname, status='running', work_unit_id='unit-1', execution_node='remote-ee', celery_task_id='original-uuid'
+        )
+        with mock.patch('awx.main.tasks.system.adopt_job_async') as mock_adopt, mock.patch('awx.main.tasks.system.reaper') as mock_reaper:
+            mock_adopt.apply_async.side_effect = RuntimeError('broker down')
+            _reap_and_mark_lost_instance(inst)
+
+        mock_reaper.reap_job.assert_not_called()
+        # Owned by the dead controller again, with its old task id: the orphan sweep's exact predicate.
+        job.refresh_from_db()
+        assert (job.status, job.controller_node, job.celery_task_id) == ('running', 'ctrl-lost', 'original-uuid')
+
+    def test_failed_publish_does_not_undo_a_later_claim(self, settings):
+        """If another controller claimed the job after ours, handing ours back must leave theirs alone."""
+        settings.AWX_AUTO_DEPROVISION_INSTANCES = False
+        inst = self._inst(hostname='ctrl-lost')
+        job = Job.objects.create(
+            controller_node=inst.hostname, status='running', work_unit_id='unit-1', execution_node='remote-ee', celery_task_id='original-uuid'
+        )
+
+        def _publish_fails_after_a_steal(**kwargs):
+            Job.objects.filter(pk=job.id).update(controller_node='other-survivor', celery_task_id='their-uuid')
+            raise RuntimeError('broker down')
+
+        with mock.patch('awx.main.tasks.system.adopt_job_async') as mock_adopt, mock.patch('awx.main.tasks.system.reaper') as mock_reaper:
+            mock_adopt.apply_async.side_effect = _publish_fails_after_a_steal
+            _reap_and_mark_lost_instance(inst)
+
+        mock_reaper.reap_job.assert_not_called()
+        job.refresh_from_db()
+        assert (job.controller_node, job.celery_task_id) == ('other-survivor', 'their-uuid')
+
+    def test_reap_leaves_a_job_this_controller_is_adopting_when_its_execution_node_is_lost(self, settings):
+        """Our own adoption is the job's owner; a lost EE is the adoption's to time out, not the reaper's (3.9)."""
+        settings.AWX_AUTO_DEPROVISION_INSTANCES = False
+        inst = self._inst(hostname='ee-lost', node_type='execution')
+        job = Job.objects.create(
+            controller_node=settings.CLUSTER_HOST_ID,
+            status='running',
+            work_unit_id='unit-abc',
+            execution_node=inst.hostname,
+            celery_task_id='adoption-uuid',
+        )
+        with mock.patch('awx.main.tasks.system.adopt_job_async') as mock_adopt, mock.patch('awx.main.tasks.system.reaper') as mock_reaper:
+            _reap_and_mark_lost_instance(inst)
+
+        mock_adopt.apply_async.assert_not_called()
+        mock_reaper.reap_job.assert_not_called()
+        job.refresh_from_db()
+        assert (job.status, job.celery_task_id) == ('running', 'adoption-uuid')
+
     def test_reap_does_not_adopt_when_only_execution_node_is_lost(self, settings):
         """A lost EE leaves the job's controller alive and still running it — reap, never adopt."""
         settings.AWX_AUTO_DEPROVISION_INSTANCES = False
