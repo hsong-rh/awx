@@ -174,6 +174,15 @@ class TestArtifactsHandler:
         assert 'ansible_version' not in rc.extra_update_fields
         assert rc.artifacts_processed is True
 
+    def test_hits_the_artifacts_failpoint_before_processing(self, mock_me):
+        rc = RunnerCallback()
+        rc.instance = mock.Mock(id=42)
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch('awx.main.tasks.callback.failpoint') as fp:
+            rc.artifacts_handler(tmpdir)
+
+        fp.assert_called_once_with('callback.artifacts', job_id=42)
+        assert rc.artifacts_processed is True
+
 
 @pytest.mark.parametrize('task_action', ['git', 'svn', 'ansible.builtin.git', 'ansible.builtin.svn'])
 def test_project_update_redacts_scm_credentials(task_action, mock_me):
