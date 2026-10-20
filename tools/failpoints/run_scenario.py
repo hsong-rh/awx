@@ -31,7 +31,7 @@ cancel-orphan dead/deferred):
             event counter --seam-counter (callback.event pause), backlogs are counted in
             events (--seam-backlog, callback_receiver.before_read), the lost-instance decision
             is forced and the heartbeat triggered explicitly (heartbeat.force_lost), adoptions
-            are held before they are published (adoption.before_queue), and slow-controller's
+            are held before they are published (adoption.before_adoption_published), and slow-controller's
             two finalizers run in a fixed --order (callback.artifacts).
 Each run also writes metrics.json (outcome, magnitudes, key step timings, duration) next to
 result.json.
@@ -1084,7 +1084,7 @@ def scenario_cancel_orphan(containers, args):
     and the peer's lost check is forced and its heartbeat triggered instead of waiting about two
     minutes for is_lost. deferred: peer claims are vetoed (a slow restart cannot hand the job to
     awx-2, the job-38 class), and the re-queue of the deferred adoption is held before it is
-    published (adoption.before_queue, 2nd hit) until the cancel has been issued.
+    published (adoption.before_adoption_published, 2nd hit) until the cancel has been issued.
     """
     c0 = containers[0]
     pr = is_pr_branch(c0)
@@ -1104,12 +1104,12 @@ def scenario_cancel_orphan(containers, args):
     if seam:
         if args.variant == 'deferred':
             guard_peer(peer, job_id)
-            arm(peer, 'adoption.before_queue', 'pause', {'job_id': job_id, 'node': owner}, nth=2, timeout=1800)
+            arm(peer, 'adoption.before_adoption_published', 'pause', {'job_id': job_id, 'node': owner}, nth=2, timeout=1800)
             log('seam: the 2nd adoption publish on the owner (the re-queue after the deferral) will hold')
         hold_at_counter(peer, job_id, owner, args.seam_counter)
     else:
         if args.variant == 'deferred':
-            arm(peer, 'adoption.before_queue', 'sleep', {'job_id': job_id}, seconds=0)
+            arm(peer, 'adoption.before_adoption_published', 'sleep', {'job_id': job_id}, seconds=0)
         time.sleep(args.lead)
 
     if args.variant == 'task-id-window':
@@ -1156,7 +1156,7 @@ def scenario_cancel_orphan(containers, args):
         start_back(oc, owner)
         m['restart_s'] = round(time.monotonic() - t_kill, 1)
         if seam:
-            hold = wait_hits(peer, 'adoption.before_queue', timeout=600, desc='the re-queue of the deferred adoption to hold')[0]
+            hold = wait_hits(peer, 'adoption.before_adoption_published', timeout=600, desc='the re-queue of the deferred adoption to hold')[0]
             m['requeue_held_at'] = hold['at']
             log(f"seam: re-queue held on {hold['node']} at {hold['at']}")
         hits = wait_for(
@@ -1172,7 +1172,7 @@ def scenario_cancel_orphan(containers, args):
             time.sleep(2)
         do_cancel('adoption deferred, before the next heartbeat re-queues it')
         if seam:
-            manage(peer, 'failpoint', 'disarm', 'adoption.before_queue')
+            manage(peer, 'failpoint', 'disarm', 'adoption.before_adoption_published')
             log('seam: released the re-queue')
     if args.variant == 'task-id-window':
         hit = json.loads(manage(peer, 'failpoint', 'wait', 'adoption.before_task_id_saved', '--timeout', str(args.claim_timeout)).stdout)
@@ -1193,7 +1193,7 @@ def scenario_cancel_orphan(containers, args):
         m['safe_threshold'] = int(first['ctx']['safe_threshold'])
         m['kill_to_adoption_s'] = round(at_seconds(first['at']) - at_seconds(m['killed_at']), 1)
     if args.variant == 'deferred':
-        queued = fired_hits(peer, 'adoption.before_queue') if not seam else []
+        queued = fired_hits(peer, 'adoption.before_adoption_published') if not seam else []
         m['queues'] = [f"{h['node']}@{h['at']}" for h in queued]
         if m.get('cancel_at') and m.get('deferred_at'):
             m['deferral_to_cancel_s'] = round(at_seconds(m['cancel_at']) - at_seconds(m['deferred_at']), 1)
@@ -1996,7 +1996,7 @@ def scenario_claim_race(containers, args):
     --cancel-in-adoption cancels once the winner streams and records whether the cancel is
     addressed to the adoption task that is actually running.
     Only A is told O is lost (heartbeat.force_lost on A), so B's own lost path cannot run before
-    O's natural is_lost (120 s). Recorders count claims (adoption.before_queue), adoption tasks
+    O's natural is_lost (120 s). Recorders count claims (adoption.before_adoption_published), adoption tasks
     (adoption.after_claim) and streams (adoption.after_snapshot) per node.
     """
     if len(containers) < 3:
@@ -2017,7 +2017,7 @@ def scenario_claim_race(containers, args):
         ca,
         job_id,
         [
-            'adoption.before_queue',
+            'adoption.before_adoption_published',
             'adoption.after_claim',
             'adoption.after_snapshot',
             'job.after_finalize_before_release',
@@ -2075,7 +2075,7 @@ def scenario_claim_race(containers, args):
             #     but X's task id is held before it is saved (adoption.before_task_id_saved).
             #  3. The lost path resumes, fails its claim, and on the same heartbeat
             #     _process_running_jobs sees the job owned by A with a task id that is not running
-            #     (the dead owner's), so it re-queues: held before publishing (adoption.before_queue).
+            #     (the dead owner's), so it re-queues: held before publishing (adoption.before_adoption_published).
             #  4. X's task id is saved. 5. The re-queue publishes: dispatcherd discards it as a
             #     duplicate of the running X, and _queue_job_adoption saves the discarded uuid.
             names = ['lost_instance.before_claim']
@@ -2088,14 +2088,14 @@ def scenario_claim_race(containers, args):
             x = wait_hits(ca, 'adoption.before_task_id_saved', timeout=120, desc=f'{a} to sweep, claim and publish X')[0]
             m['adoption_x'] = x['ctx'].get('task_id')
             log(f"step 2: {a} swept and published adoption X={m['adoption_x']}; its task id is held before it is saved")
-            arm(ca, 'adoption.before_queue', 'pause', {'job_id': job_id, 'node': a}, timeout=900)
+            arm(ca, 'adoption.before_adoption_published', 'pause', {'job_id': job_id, 'node': a}, timeout=900)
             release_together(ca, ['lost_instance.before_claim'], lead=1.0)
-            wait_hits(ca, 'adoption.before_queue', lambda h: h['action'] == 'pause', timeout=120, desc='the lost path heartbeat to re-queue')
+            wait_hits(ca, 'adoption.before_adoption_published', lambda h: h['action'] == 'pause', timeout=120, desc='the lost path heartbeat to re-queue')
             log('step 3: the resumed heartbeat re-queues an adoption (held before publishing)')
             manage(ca, 'failpoint', 'disarm', 'adoption.before_task_id_saved')
             wait_for('X task id saved', lambda: job_state(ca, job_id)['celery_task_id'] == m['adoption_x'], 30, poll=1)
             log(f"step 4: job celery_task_id = X ({m['adoption_x']})")
-            manage(ca, 'failpoint', 'disarm', 'adoption.before_queue')
+            manage(ca, 'failpoint', 'disarm', 'adoption.before_adoption_published')
             time.sleep(3)
             m['job_task_id_after_requeue'] = job_state(ca, job_id)['celery_task_id']
             log(f"step 5: re-queue published; job celery_task_id now {m['job_task_id_after_requeue']}")
@@ -2146,7 +2146,7 @@ def scenario_claim_race(containers, args):
     wait_finished(ca, job_id, args.finish_timeout)
     start_back(oc, owner)
     time.sleep(args.settle)
-    m['claims_queued'] = by_node(fired_hits(ca, 'adoption.before_queue'))
+    m['claims_queued'] = by_node(fired_hits(ca, 'adoption.before_adoption_published'))
     m['adoption_tasks'] = by_node(fired_hits(ca, 'adoption.after_claim'))
     m['streams_adopted'] = by_node(fired_hits(ca, 'adoption.after_snapshot'))
     m['adoption_finalize'] = by_node(fired_hits(ca, 'adoption.after_finalize_before_release'))
@@ -2199,7 +2199,7 @@ def scenario_adopter_dies(containers, args):
         ca1,
         job_id,
         [
-            'adoption.before_queue',
+            'adoption.before_adoption_published',
             'adoption.after_claim',
             'adoption.after_snapshot',
             'job.after_finalize_before_release',
@@ -2307,7 +2307,7 @@ def scenario_adopter_dies(containers, args):
     time.sleep(args.settle)
     m['unit_end'] = unit_status(unit)
     m['adoption_tasks'] = by_node(fired_hits(cs, 'adoption.after_claim'))
-    m['claims_queued'] = by_node(fired_hits(cs, 'adoption.before_queue'))
+    m['claims_queued'] = by_node(fired_hits(cs, 'adoption.before_adoption_published'))
     m['finalize_then_release'] = by_node(fired_hits(cs, 'adoption.after_finalize_before_release')) | {
         f"{k} (job task)": v for k, v in by_node(fired_hits(cs, 'job.after_finalize_before_release')).items()
     }
@@ -2614,7 +2614,7 @@ emit(ids)
         m['invalid'] = f"not all jobs controlled by awx-1: {m['controllers']}"
     wait_for('awx-2 capacity back', lambda: instances(c)['awx-2']['capacity'] > 0, 180, poll=5)
     m['exec_playbooks_before_kill'] = len(exec_node_processes(r'ansible-playbook'))
-    arm_recorders(c, None, ['adoption.before_queue', 'adoption.after_claim', 'adoption.after_snapshot', 'adoption.after_finalize_before_release'])
+    arm_recorders(c, None, ['adoption.before_adoption_published', 'adoption.after_claim', 'adoption.after_snapshot', 'adoption.after_finalize_before_release'])
 
     samples = []
     stop = threading.Event()
@@ -2793,10 +2793,10 @@ def scenario_claim_no_queue(containers, args):
 
     PR only (devel has no cross-controller claim). Two control nodes. The owner is held before
     event --seam-counter and killed; the peer is told it is lost.
-      --variant lost           the lost-instance path claims; adoption.before_queue raises once
+      --variant lost           the lost-instance path claims; adoption.before_adoption_published raises once
                                (after the claim, before adopt_job_async is published)
       --variant sweep          the lost path only marks the owner offline (its claim vetoed);
-                               the sweep claims and adoption.before_queue raises once
+                               the sweep claims and adoption.before_adoption_published raises once
       --variant after-publish  the lost path claims and publishes; saving the task id raises once
                                (adoption.before_task_id_saved)
     Watches --observe seconds for a retry (an adoption snapshot) and records the final status.
@@ -2813,7 +2813,7 @@ def scenario_claim_no_queue(containers, args):
     notes = [f'claim-no-queue {args.variant}: owner {owner}, peer {ph}']
     arm_hold(peer, job_id, owner, args.seam_counter)
     arm_recorders(peer, job_id, ['adoption.after_claim', 'adoption.after_snapshot', 'adoption.after_finalize_before_release'])
-    inject = 'adoption.before_task_id_saved' if args.variant == 'after-publish' else 'adoption.before_queue'
+    inject = 'adoption.before_task_id_saved' if args.variant == 'after-publish' else 'adoption.before_adoption_published'
     arm(peer, inject, 'raise', {'job_id': job_id, 'node': ph}, times=1)
     if args.variant == 'sweep':
         arm(peer, 'lost_instance.before_claim', 'raise', {'job_id': job_id})
@@ -3754,6 +3754,7 @@ def slow_seam(c0, peer, ph, owner, job_id, args, m, notes, on_both_streaming=Non
     heartbeat paused, the peer told it is lost (claim + second stream), then the owner is let go.
     The second finalizer of --order waits at callback.artifacts until the first has finalized.
     on_both_streaming() runs once both streams are live (stats-insert-race holds its writers there)."""
+    since = since_now()
     second = owner if args.order == 'adopter-first' else ph
     arm_recorders(c0, job_id, ['adoption.after_snapshot', 'job.after_finalize_before_release', 'adoption.after_finalize_before_release'])
     arm(c0, 'callback.artifacts', 'pause', {'job_id': job_id, 'node': second}, timeout=1800)
@@ -3777,11 +3778,24 @@ def slow_seam(c0, peer, ph, owner, job_id, args, m, notes, on_both_streaming=Non
         on_both_streaming()
     first_hit = 'job.after_finalize_before_release' if second == ph else 'adoption.after_finalize_before_release'
     try:
-        h = wait_hits(c0, first_hit, timeout=args.finish_timeout, poll=3)[0]
-        log(f'seam: first finalizer done ({first_hit} on {h["node"]} at {h["at"]}); releasing {second}')
-        m['first_finalizer'] = h['node']
+        if second == ph:
+            # The owner's finalize hits the ownership fence (NotOwner) once the peer has claimed the job, and the
+            # fence skips the release path where job.after_finalize_before_release fires. Wait for its log line.
+            oc = container_for(owner)
+
+            def fenced():
+                out = run(['docker', 'logs', '--since', since, oc], check=False)
+                return re.search(rf'job {job_id} \(\w+\) was taken over by task', out.stdout + out.stderr) is not None
+
+            wait_for(f'{owner} to be fenced out of its finalize', fenced, args.finish_timeout, poll=5)
+            log(f'seam: first finalizer ({owner}) was fenced out by the adoption; releasing {second}')
+            m['first_finalizer'] = owner
+        else:
+            h = wait_hits(c0, first_hit, timeout=args.finish_timeout, poll=3)[0]
+            log(f'seam: first finalizer done ({first_hit} on {h["node"]} at {h["at"]}); releasing {second}')
+            m['first_finalizer'] = h['node']
     except TimeoutError as exc:
-        notes.append(f'first finalizer never reached {first_hit}: {exc}')
+        notes.append(f'first finalizer never finished: {exc}')
     manage(c0, 'failpoint', 'disarm', 'callback.artifacts')
 
 
@@ -3818,7 +3832,7 @@ def scenario_data_check(containers, args):
                             finalize in --order; devel: the owner's heartbeat is paused until the
                             peer reaps, then the owner finalizes again
       --variant reap        a job that ends with no stats: PR, the peer's lost path claims and
-                            adoption.before_queue raises once, so it reaps; devel: as cross-node
+                            adoption.before_adoption_published raises once, so it reaps; devel: as cross-node
     Before launch the hosts' HostMetric counters are recorded as the host_metrics snapshot.
     Writes dc.json (all collected data) and stdout.txt next to result.json and metrics.json.
     """
@@ -3859,7 +3873,7 @@ def scenario_data_check(containers, args):
     elif args.variant in ('cross-node', 'reap'):
         arm_hold(c0, job_id, owner, args.seam_counter)
         if args.variant == 'reap' and pr:
-            arm(peer, 'adoption.before_queue', 'raise', {'job_id': job_id, 'node': ph}, times=1)
+            arm(peer, 'adoption.before_adoption_published', 'raise', {'job_id': job_id, 'node': ph}, times=1)
         orphan_owner(peer, ph, owner, job_id, args, m, pr)
     elif args.variant == 'slow':
         if pr:
@@ -4130,7 +4144,7 @@ def scenario_same_hosts(containers, args):
     then sleeps 1 s) over the 3 dc hosts. Job A's owner is held before --seam-counter and killed
     (left down until the end). Job B, from the same template, is launched right after the kill.
       --variant kill  PR: the peer adopts A (seam); devel: the peer's lost path reaps A after is_lost
-      --variant reap  PR: the peer claims A and adoption.before_queue raises once, so A is reaped
+      --variant reap  PR: the peer claims A and adoption.before_adoption_published raises once, so A is reaped
     Measures when B starts against when A's playbook really ends, and the per-host overlap of
     A's and B's playbook activity (marker file; else the work units' event times).
     """
@@ -4152,7 +4166,7 @@ def scenario_same_hosts(containers, args):
     arm_hold(c0, a, owner, args.seam_counter)
     arm_recorders(peer, a, ['adoption.after_claim', 'adoption.after_snapshot', 'adoption.after_finalize_before_release'])
     if args.variant == 'reap' and pr:
-        arm(peer, 'adoption.before_queue', 'raise', {'job_id': a, 'node': ph}, times=1)
+        arm(peer, 'adoption.before_adoption_published', 'raise', {'job_id': a, 'node': ph}, times=1)
     wait_hold(c0, a, owner, args.seam_counter)
     wait_db_events(c0, a, args.seam_counter)
     m['killed_at'] = kill(oc)
@@ -4382,7 +4396,11 @@ def scenario_disable_live(containers, args):
     oc, peer, ph = peer_of(containers, owner)
     m = {'owner': owner, 'peer': ph, 'variant': args.variant, 'branch': 'PR' if pr else 'devel'}
     notes = [f"disable-live {args.variant} on {m['branch']}"]
-    arm_recorders(c0, job_id, ['adoption.after_claim', 'adoption.after_snapshot', 'adoption.before_queue', 'sweep.before_claim', 'lost_instance.before_claim'])
+    arm_recorders(
+        c0,
+        job_id,
+        ['adoption.after_claim', 'adoption.after_snapshot', 'adoption.before_adoption_published', 'sweep.before_claim', 'lost_instance.before_claim'],
+    )
     time.sleep(args.lead)
     if args.variant == 'disable':
         m['changed'] = set_instance(c0, owner, enabled=False)
@@ -4543,7 +4561,7 @@ emit({{j.id: dict(started=j.started, status=j.status, controller=j.controller_no
 # --- infrastructure faults and observability (part 5 queue) ----------------------------------
 
 PG_CONTAINER = 'tools_postgres_1'
-PG_VOLUME = 'tools_awx_db_15_failpoints'
+PG_VOLUMES = ('tools_awx_db_15_failpoints', 'tools_awx_db_15')
 REDIS_CONTAINERS = ('tools_redis_1', 'tools_redis_2')
 
 
@@ -4561,8 +4579,8 @@ def pg_restart():
     run(['docker', 'restart', PG_CONTAINER], timeout=180)
     wait_for('postgres ready', lambda: run(['docker', 'exec', PG_CONTAINER, 'pg_isready', '-U', 'awx'], check=False).returncode == 0, 120, poll=1)
     mounts = pg_mounts()
-    if mounts != [PG_VOLUME]:
-        raise SystemExit(f'postgres mounts {mounts}, expected only {PG_VOLUME}')
+    if len(mounts) != 1 or mounts[0] not in PG_VOLUMES:
+        raise SystemExit(f'postgres mounts {mounts}, expected only one of {PG_VOLUMES}')
     t1 = utcnow()
     log(f'postgres restarted {t0} -> ready {t1}; mounts {mounts}')
     return {'restart_at': t0, 'ready_at': t1, 'mounts': mounts}
@@ -4713,6 +4731,11 @@ def scenario_mesh_cut(containers, args):
     link (receptor-hop dials awx-2:2222) is rejected inside awx-2's network namespace. awx-2 is
     then told awx-1 is lost (PR). After --observe seconds the link is restored and the job
     watched to the end.
+
+      --variant adopt    (default) as above: the job is adopted by a peer that cannot reach the EE.
+      --variant own-job  awx-1 stays up and keeps running its own job. Its link to receptor-1 is cut
+                         and it is told receptor-1 is lost, so the lost-instance reap sees a job it
+                         controls on a lost execution node. The job must end on its own task's say.
     """
     need_two(containers, 'mesh-cut')
     c0 = containers[0]
@@ -4721,8 +4744,10 @@ def scenario_mesh_cut(containers, args):
     job_id, st = start_job(containers, args)
     owner, unit = st['controller_node'], st['work_unit_id']
     oc, peer, ph = peer_of(containers, owner)
+    own = args.variant == 'own-job'
+    cut, cut_name = (oc, owner) if own else (peer, ph)  # whose link is cut, and who judges receptor-1 lost
     hop_ip = container_ip('tools_receptor_hop')
-    m = {'owner': owner, 'peer': ph, 'branch': 'PR' if pr else 'devel', 'iterations': args.iterations, 'hop_ip': hop_ip}
+    m = {'variant': args.variant, 'owner': owner, 'peer': ph, 'branch': 'PR' if pr else 'devel', 'iterations': args.iterations, 'hop_ip': hop_ip}
     notes = []
     arm_recorders(peer, job_id, ['adoption.after_claim', 'adoption.after_snapshot', 'adoption.unit_status', 'adoption.after_finalize_before_release'])
     arm_hold(c0, job_id, owner, args.seam_counter)
@@ -4732,19 +4757,30 @@ def scenario_mesh_cut(containers, args):
         ['INPUT', '-s', hop_ip, '-p', 'tcp', '--dport', '2222', '-j', 'REJECT', '--reject-with', 'tcp-reset'],
         ['OUTPUT', '-d', hop_ip, '-p', 'tcp', '--sport', '2222', '-j', 'REJECT', '--reject-with', 'tcp-reset'],
     ]
+    if own:
+        # awx-1 also peers with awx-2, which reaches receptor-1 through the hop, so cut that link too.
+        # Which of awx-2's networks the link uses changes across restarts, so block them all.
+        for net in ('awx', 'service-mesh'):
+            peer_ip = container_ip(peer, net)
+            if peer_ip:
+                rules += [
+                    ['INPUT', '-s', peer_ip, '-p', 'tcp', '-m', 'multiport', '--ports', '2222', '-j', 'REJECT', '--reject-with', 'tcp-reset'],
+                    ['OUTPUT', '-d', peer_ip, '-p', 'tcp', '-m', 'multiport', '--ports', '2222', '-j', 'REJECT', '--reject-with', 'tcp-reset'],
+                ]
     for r in rules:
-        out = iptables(peer, '-I', *r)
+        out = iptables(cut, '-I', *r)
         if out.returncode:
-            raise SystemExit(f'iptables failed in {peer}: {out.stderr}')
+            raise SystemExit(f'iptables failed in {cut}: {out.stderr}')
     m['cut_at'] = utcnow()
-    m['killed_at'] = kill(oc)
+    if not own:
+        m['killed_at'] = kill(oc)
     manage(peer, 'failpoint', 'disarm', 'callback.event')
     try:
-        wait_for(f'{ph} to lose its route to receptor-1', lambda: not mesh_sees(peer, 'receptor-1'), 120, poll=2)
+        wait_for(f'{cut_name} to lose its route to receptor-1', lambda: not mesh_sees(cut, 'receptor-1'), 120, poll=2)
         m['route_lost_at'] = utcnow()
-        log(f'{ph} has no route to receptor-1')
+        log(f'{cut_name} has no route to receptor-1')
         if pr:
-            force_lost(peer, ph, owner)
+            force_lost(cut, cut_name, 'receptor-1' if own else owner)
         samples = []
         t0 = time.monotonic()
         while time.monotonic() - t0 < args.observe:
@@ -4757,13 +4793,13 @@ def scenario_mesh_cut(containers, args):
         m['adoption_attempts'] = [f"{h['node']}@{h['at']}" for h in fired_hits(peer, 'adoption.after_claim')]
     finally:
         for r in rules:
-            iptables(peer, '-D', *r)
+            iptables(cut, '-D', *r)
         m['restored_at'] = utcnow()
-        log(f'{ph} mesh link restored')
-    wait_for(f'{ph} route back', lambda: mesh_sees(peer, 'receptor-1'), 180, poll=3)
+        log(f'{cut_name} mesh link restored')
+    wait_for(f'{cut_name} route back', lambda: mesh_sees(cut, 'receptor-1'), 180, poll=3)
     s = watch(peer, job_id, unit, args.finish_timeout, until=terminal, poll=5)
     if pr:
-        manage(peer, 'failpoint', 'disarm', 'heartbeat.force_lost', check=False)
+        manage(cut, 'failpoint', 'disarm', 'heartbeat.force_lost', check=False)
     m['unit_end'] = unit_end(peer, job_id, unit, seconds=240)
     ensure_up(containers)
     time.sleep(args.settle)
@@ -5471,7 +5507,7 @@ def orphan_and_decide(c0, peer, ph, owner, job_id, args, m, pr, reap_on_pr=False
     claim-no-queue lost path); devel: wait for the natural reap."""
     arm_hold(c0, job_id, owner, args.seam_counter)
     if pr and reap_on_pr:
-        arm(peer, 'adoption.before_queue', 'raise', {'job_id': job_id, 'node': ph}, times=1)
+        arm(peer, 'adoption.before_adoption_published', 'raise', {'job_id': job_id, 'node': ph}, times=1)
     orphan_owner(peer, ph, owner, job_id, args, m, pr)
 
 
@@ -5535,7 +5571,7 @@ def scenario_relaunch_orphan(containers, args):
 def scenario_cancel_wf_orphan(containers, args):
     """Cancel a workflow while its running node's job is orphaned, in one window:
       --variant dead       owner killed, nobody told yet (PR) / before devel's reap
-      --variant claim      PR: held at adoption.before_queue (claimed, not published)
+      --variant claim      PR: held at adoption.before_adoption_published (claimed, not published)
       --variant deferred   PR: held at adoption.after_claim (adoption task running, before the snapshot)
       --variant streaming  PR: after the adoption snapshot
     Then the workflow job is canceled (WorkflowJob.cancel()). Final states of the workflow, node A's
@@ -5564,7 +5600,7 @@ def scenario_cancel_wf_orphan(containers, args):
     finally:
         set_instance(c2, 'awx-2', enabled=True)
     m = {'branch': 'PR' if pr else 'devel', 'variant': args.variant, 'workflow_job': wj, 'a_job': a, 'iterations': args.iterations}
-    seam = {'claim': 'adoption.before_queue', 'deferred': 'adoption.after_claim'}.get(args.variant)
+    seam = {'claim': 'adoption.before_adoption_published', 'deferred': 'adoption.after_claim'}.get(args.variant)
     arm_recorders(c2, a, ['adoption.after_snapshot', 'adoption.after_finalize_before_release'])
     if seam:
         arm(c2, seam, 'pause', {'job_id': a}, timeout=1800)
@@ -6434,13 +6470,13 @@ def scenario_hop_restart(containers, args):
 
 def scenario_delete_during(containers, args):
     """Deleting the job or its inventory during adoption: the adopter is held at --variant's seam
-    (claim: adoption.before_queue, snapshot: adoption.after_claim, finalize: adoption.before_finalize);
+    (claim: adoption.before_adoption_published, snapshot: adoption.after_claim, finalize: adoption.before_finalize);
     the job, then its inventory, are deleted through the API; then the hold is released.
     PR: cross-node; devel: same-node (finalize only)."""
     need_two(containers, 'delete-during')
     c0 = containers[0]
     pr = is_pr_branch(c0)
-    seam = {'claim': 'adoption.before_queue', 'snapshot': 'adoption.after_claim', 'finalize': 'adoption.before_finalize'}[args.variant]
+    seam = {'claim': 'adoption.before_adoption_published', 'snapshot': 'adoption.after_claim', 'finalize': 'adoption.before_finalize'}[args.variant]
     if not pr and args.variant != 'finalize':
         raise SystemExit('delete-during: only finalize applies on devel')
     observer_session(c0)
@@ -6896,6 +6932,7 @@ VARIANTS = {
     'workflow-orphan': ('slow', 'kill'),
     'set-stats-artifacts': ('kill', 'slow'),
     'claim-no-queue': ('lost', 'sweep', 'after-publish'),
+    'mesh-cut': ('adopt', 'own-job'),
     'both-controllers-lost': ('peer-returns', 'owner-returns'),
     'exec-node-dies': ('restart', 'kill-start'),
     'job-timeout': ('kill', 'none'),
