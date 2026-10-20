@@ -1223,7 +1223,8 @@ def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None):
     swept = 0
     for orphan in orphans:
         try:
-            if not _room_for_another_controllers_job():
+            # The orphan is not in consumed_capacity until the claim lands, so ask for its impact up front.
+            if not _room_for_another_controllers_job(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT):
                 logger.info(f'Orphan sweep stopping at {swept} adoptions: out of control capacity, peer or next heartbeat takes the rest')
                 break
             failpoint('sweep.before_claim', job_id=orphan.id, former=orphan.controller_node)

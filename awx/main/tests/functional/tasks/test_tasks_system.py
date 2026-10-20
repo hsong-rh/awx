@@ -1800,6 +1800,20 @@ class TestOrphanSweep:
         # The remainder must stay owned by the dead controller so the peer's sweep still sees them.
         assert all(Job.objects.get(pk=j.pk).controller_node == 'dead-controller' for j in jobs if j not in claimed)
 
+    def test_sweep_asks_for_headroom_for_a_job_it_has_not_claimed(self, me_inst):
+        """The orphan is not counted in consumed_capacity until the claim lands, so a controller at
+        exactly capacity must be refused. With headroom 0 it took one job too many, which
+        adoption then deferred and parked in a slot (gist 4.16: capacity 5, 6 consumed)."""
+        self._orphan(work_unit_id='unit-0')
+
+        with (
+            patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=False) as room,
+            patch('awx.main.tasks.system._publish_adoption'),
+        ):
+            _sweep_orphaned_jobs(me_inst)
+
+        room.assert_called_with(headroom_needed=django_settings.AWX_CONTROL_NODE_TASK_IMPACT)
+
     def test_oldest_jobs_are_swept_first(self, me_inst):
         """When capacity is short, the job that has been stranded longest is the one closest to
         its adoption deadline, so it is the one that must not wait another cycle."""
@@ -1820,7 +1834,7 @@ class TestOrphanSweep:
         0 rows and it must not then queue an adoption for a job the winner now owns."""
         job = self._orphan()
 
-        def peer_wins_the_claim():
+        def peer_wins_the_claim(**_):
             # Runs between the orphan query and our UPDATE, exactly where the race lives.
             Job.objects.filter(pk=job.pk).update(controller_node='live-peer')
             return True
@@ -2065,6 +2079,20 @@ class TestLostInstanceCapacity:
             _handle_lost_instance_job(job, lost)
 
         assert slot.call_args.kwargs.get('headroom_needed') == django_settings.AWX_CONTROL_NODE_TASK_IMPACT
+
+    def test_sweep_leaves_the_job_when_this_controller_is_exactly_full(self, me_inst):
+        """Through the real gate: the sweep must not take a job that would put us over capacity."""
+        me_inst.node_type = 'control'
+        me_inst.capacity = 1
+        me_inst.save()
+        Job.objects.create(controller_node=me_inst.hostname, status='running')
+        orphan = Job.objects.create(controller_node='dead-controller', status='running', work_unit_id='unit-0', started=now() - timedelta(seconds=600))
+
+        with patch('awx.main.tasks.system._publish_adoption') as queue, patch('awx.main.tasks.system._receptor_mesh_hostnames', return_value=set()):
+            _sweep_orphaned_jobs(me_inst)
+
+        assert Job.objects.get(pk=orphan.pk).controller_node == 'dead-controller'
+        queue.assert_not_called()
 
     def test_an_already_claimed_job_fits_at_exactly_capacity(self, me_inst):
         """Default behaviour, unchanged: the job is already counted in consumed_capacity, so
