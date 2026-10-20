@@ -242,6 +242,35 @@ def test_stalled_stream_is_finalized_once_stalled_past_the_budget(adoption_env, 
     assert UNIT not in work.units, 'and the unit is released'
 
 
+@pytest.mark.django_db
+def test_cut_off_stream_fails_the_job_once_cut_off_past_the_budget(adoption_env, orphan):
+    # The unit is not terminal: the local receptor still answers for it, the execution node is gone.
+    cache.clear()
+    job, _ = orphan
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(make_events(10))})
+    clock = FakeClock()
+
+    def cut_off(receptor_job, _work):
+        receptor_job.stream_stalled = True
+        receptor_job.stream_cut_off = True
+        return None
+
+    with (
+        mock.patch('awx.main.tasks.receptor.AWXReceptorJob._process_phase', cut_off),
+        mock.patch('awx.main.tasks.receptor._determine_adoption_status_from_unit', return_value=(None, None, False)),
+    ):
+        adopt_job(job.id, open_work=lambda: work, clock=clock)
+        job.refresh_from_db()
+        assert job.status == 'running', 'the wait is bounded, not skipped'
+
+        clock.advance(TIMEOUT + 1)
+        adopt_job(job.id, open_work=lambda: work, clock=clock)
+
+    job.refresh_from_db()
+    assert job.status == 'failed'
+    assert 'unreachable' in job.job_explanation
+
+
 # ── The orphan sweep on the injected clock ───────────────────────────────────
 
 
