@@ -246,6 +246,17 @@ def test_process_phase_success(mock_signal, mock_connections):
     mock_connections.close_all.assert_called_once()
 
 
+@patch('awx.main.tasks.receptor.connections')
+@patch('awx.main.tasks.receptor.signal_callback', return_value=False)
+def test_process_phase_returns_none_when_the_stalled_processor_never_exits(mock_signal, mock_connections):
+    """_await_processor gives up on a processor thread that ignores the socket shutdown; there is no result to read."""
+    rj = _make_receptor_job()
+    rj.processor = Mock()
+    rj._await_processor = Mock(return_value=None)
+
+    assert rj._process_phase(ReceptorWork(_make_receptor_ctl())) is None
+
+
 # ---------------------------------------------------------------------------
 # AWXReceptorJob._process_phase — SignalExit path
 #
