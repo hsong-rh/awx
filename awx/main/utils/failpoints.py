@@ -53,6 +53,7 @@ REGISTRY = {
     'job.after_submit_before_unit_saved': 'Normal job path: work unit submitted to receptor, work_unit_id not yet saved on the job.',
     'job.stream_started': 'Normal job and adoption path: results stream opened, before the first event is read.',
     'callback.event': 'Every event handed to the callback (ctx: job_id, counter). Use with --match counter=N or --nth.',
+    'callback.artifacts': 'RunnerCallback.artifacts_handler: start of the end-of-run artifacts processing, on a normal run and on an adoption (ctx: job_id).',
     'job.before_finalize': 'Normal job path: playbook finished, before the terminal status is saved.',
     'job.after_finalize_before_release': 'Normal job path: terminal status saved, before the work unit is released.',
     'adoption.after_snapshot': 'reattach_to_work_unit: dedup snapshot taken, before the replay starts.',

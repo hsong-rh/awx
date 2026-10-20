@@ -151,3 +151,12 @@ class TestArtifactsHandler:
         assert 'installed_collections' not in rc.extra_update_fields
         assert 'ansible_version' not in rc.extra_update_fields
         assert rc.artifacts_processed is True
+
+    def test_hits_the_artifacts_failpoint_before_processing(self, mock_me):
+        rc = RunnerCallback()
+        rc.instance = mock.Mock(id=42)
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch('awx.main.tasks.callback.failpoint') as fp:
+            rc.artifacts_handler(tmpdir)
+
+        fp.assert_called_once_with('callback.artifacts', job_id=42)
+        assert rc.artifacts_processed is True
