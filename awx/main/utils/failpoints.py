@@ -12,6 +12,7 @@ Typical use from a test or a shell::
     awx-manage failpoint wait heartbeat.start --fired
     ...do something elsewhere...
     awx-manage failpoint release heartbeat.start
+    awx-manage failpoint release sweep.before_claim lost_instance.before_claim --in 2   # all resume together
 
 Actions:
     pause   block until released or disarmed (``--timeout`` seconds, default 600)
@@ -151,6 +152,7 @@ def ensure_tables():
                 PRIMARY KEY (kind, key)
             )'''
         )
+        cursor.execute(f'ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS release_at double precision')
     _table_ready = True
 
 
@@ -222,7 +224,7 @@ def _pause(name, arg):
     while time.monotonic() < deadline:
         try:
             with connection.cursor() as cursor:
-                cursor.execute(f'SELECT released FROM {TABLE} WHERE name = %s', [name])
+                cursor.execute(f'SELECT released, release_at, extract(epoch from clock_timestamp())::double precision FROM {TABLE} WHERE name = %s', [name])
                 row = cursor.fetchone()
         except DatabaseError:
             # The database went away while held (a scenario restarting or cutting it off). Keep
@@ -232,10 +234,29 @@ def _pause(name, arg):
             time.sleep(1)
             continue
         if row is None or row[0]:
+            if row is not None and row[1] is not None:
+                _wait_until(name, row[1], row[2])
             logger.warning(f'Failpoint {name}: released pid={os.getpid()}')
             return
         time.sleep(PAUSE_POLL_SECONDS)
     logger.error(f'Failpoint {name}: pause timed out after {timeout}s, continuing')
+
+
+def _wait_until(name, release_at, db_now):
+    """A scheduled release: sleep until the database-clock instant every holder was given, then
+    record how late this caller woke ('resumed' hit, ctx late_ms)."""
+    time.sleep(max(0.0, release_at - db_now))
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT extract(epoch from clock_timestamp())::double precision')
+            woke = cursor.fetchone()[0]
+            ctx = {'node': settings.CLUSTER_HOST_ID, 'pid': os.getpid(), 'late_ms': round((woke - release_at) * 1000, 1), 'woke': woke}
+            cursor.execute(
+                f'INSERT INTO {HIT_TABLE} (name, node, pid, ctx, fired, action) VALUES (%s, %s, %s, %s, false, %s)',
+                [name, ctx['node'], ctx['pid'], json.dumps(ctx), 'resumed'],
+            )
+    except Exception:
+        logger.exception(f'Failpoint {name}: could not record the scheduled resume')
 
 
 def _exception_class(path):
@@ -338,7 +359,7 @@ def arm(name, action, match=None, nth=None, times=None, **arg):
             VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (name) DO UPDATE SET action = EXCLUDED.action, arg = EXCLUDED.arg,
                 match = EXCLUDED.match, nth = EXCLUDED.nth, times = EXCLUDED.times,
-                hits = 0, fired = 0, released = false, armed_at = now()
+                hits = 0, fired = 0, released = false, release_at = NULL, armed_at = now()
             ''',
             [name, action, json.dumps(arg), json.dumps(match or {}), nth, times],
         )
@@ -349,6 +370,23 @@ def release(name):
     with connection.cursor() as cursor:
         cursor.execute(f'UPDATE {TABLE} SET released = true WHERE name = %s', [name])
         return cursor.rowcount
+
+
+def release_in(names, lead):
+    """Release several failpoints with one UPDATE, every holder resuming at the same instant.
+
+    The instant is ``lead`` seconds ahead on the database clock, which every node shares. now() is
+    fixed for the statement, so every row gets the same instant (clock_timestamp() would not).
+    Returns {'at': epoch seconds, 'rows': rows released}.
+    """
+    ensure_tables()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'UPDATE {TABLE} SET released = true, release_at = extract(epoch from now()) + %s WHERE name = ANY(%s) RETURNING release_at',
+            [float(lead), list(names)],
+        )
+        rows = cursor.fetchall()
+    return {'at': rows[0][0] if rows else None, 'rows': len(rows)}
 
 
 def disarm(name=None):

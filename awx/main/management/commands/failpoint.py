@@ -38,8 +38,11 @@ class Command(BaseCommand):
         p.add_argument('--seconds', type=float, help='sleep: how long to sleep')
         p.add_argument('--exception', help='raise: dotted exception class to raise instead of FailpointError')
 
-        p = sub.add_parser('release', help='Let paused callers of a failpoint continue')
-        p.add_argument('name')
+        p = sub.add_parser('release', help='Let paused callers of one or more failpoints continue')
+        p.add_argument('name', nargs='+')
+        p.add_argument(
+            '--in', dest='lead', type=float, metavar='SECONDS', help='Release all the names with one UPDATE; every holder resumes SECONDS from now, together'
+        )
 
         p = sub.add_parser('disarm', help='Remove a failpoint, or all with --all')
         p.add_argument('name', nargs='?')
@@ -74,8 +77,13 @@ class Command(BaseCommand):
                 raise CommandError(str(exc))
             self.stdout.write(f"armed {options['name']}")
         elif cmd == 'release':
-            n = failpoints.release(options['name'])
-            self.stdout.write(f"released {options['name']} ({n} row)")
+            if options['lead'] is not None:
+                out = failpoints.release_in(options['name'], options['lead'])
+                self.stdout.write(f"released {' '.join(options['name'])} {json.dumps(out)}")
+            else:
+                for name in options['name']:
+                    n = failpoints.release(name)
+                    self.stdout.write(f"released {name} ({n} row)")
         elif cmd == 'disarm':
             if not options['name'] and not options['all']:
                 raise CommandError('give a name or --all')

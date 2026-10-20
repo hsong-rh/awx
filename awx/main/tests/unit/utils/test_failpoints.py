@@ -1,3 +1,4 @@
+import json
 import pathlib
 import re
 import signal
@@ -187,7 +188,7 @@ class _FlakyCursor:
             raise failpoints.DatabaseError('server closed the connection unexpectedly')
 
     def fetchone(self):
-        return (True,)
+        return (True, None, 0.0)
 
 
 def test_pause_survives_a_database_restart():
@@ -216,3 +217,56 @@ def test_failpoint_returns_none_when_it_did_not_fire(settings):
         assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None
     settings.AWX_FAILPOINTS_ENABLED = False
     assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None
+
+
+class _RecordingCursor:
+    """Answers the pause poll with a scheduled release, and keeps what else is executed."""
+
+    def __init__(self, row, woke):
+        self.row = row
+        self.woke = woke
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        return self.row if len(self.executed) == 1 else (self.woke,)
+
+
+def test_scheduled_release_sleeps_to_the_shared_instant_and_records_how_late(settings):
+    settings.CLUSTER_HOST_ID = 'awx-2'
+    cursor = _RecordingCursor(row=(True, 1000.0, 998.0), woke=1000.05)
+    with mock.patch.object(failpoints.connection, 'cursor', return_value=cursor), mock.patch.object(failpoints.time, 'sleep') as sleep:
+        failpoints._pause('sweep.before_claim', {'timeout': 60})
+    sleep.assert_called_once_with(2.0)
+    sql, params = cursor.executed[-1]
+    assert 'INSERT INTO' in sql and params[0] == 'sweep.before_claim' and params[1] == 'awx-2' and params[4] == 'resumed'
+    assert json.loads(params[3])['late_ms'] == 50.0
+
+
+def test_plain_release_records_no_resume_and_does_not_wait(settings):
+    cursor = _RecordingCursor(row=(True, None, 998.0), woke=0)
+    with mock.patch.object(failpoints.connection, 'cursor', return_value=cursor), mock.patch.object(failpoints.time, 'sleep') as sleep:
+        failpoints._pause('sweep.before_claim', {'timeout': 60})
+    sleep.assert_not_called()
+    assert len(cursor.executed) == 1
+
+
+def test_release_in_releases_every_name_with_one_update():
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchall.return_value = [(1000.0,), (1000.0,)]
+    with mock.patch.object(failpoints, 'ensure_tables'), mock.patch.object(failpoints.connection, 'cursor', return_value=cursor):
+        out = failpoints.release_in(['sweep.before_claim', 'lost_instance.before_claim'], 2.0)
+    assert out == {'at': 1000.0, 'rows': 2}
+    assert cursor.execute.call_count == 1
+    sql, params = cursor.execute.call_args[0]
+    assert 'now()' in sql and 'clock_timestamp' not in sql
+    assert params == [2.0, ['sweep.before_claim', 'lost_instance.before_claim']]
