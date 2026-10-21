@@ -3281,14 +3281,21 @@ def scenario_repeated_restarts(containers, args):
         guard_peer(peer, job_id)
     for k in range(args.restarts):
         counter = args.seam_counter + k * args.restart_step
-        if k:
-            arm_hold(peer, job_id, owner, counter)
         wait_hold(peer, job_id, owner, counter)
         wait_db_events(peer, job_id, counter)
         n = len(fired_hits(peer, 'adoption.after_snapshot'))
         t = time.monotonic()
-        kill_and_restart(oc, peer, owner)
+        run(['docker', 'kill', oc])
+        log(f'docker kill {oc}')
         manage(peer, 'failpoint', 'disarm', 'callback.event')
+        if k + 1 < args.restarts:
+            # Armed while the owner is down: its adoption replays the rest of the job within seconds,
+            # so a hold armed after the adoption's snapshot is already behind the replay.
+            arm_hold(peer, job_id, owner, args.seam_counter + (k + 1) * args.restart_step)
+        run(['docker', 'start', oc])
+        log(f'docker start {oc}')
+        wait_for(f'{owner} to answer awx-manage', lambda: manage(oc, 'failpoint', 'list', check=False).returncode == 0, 600, poll=10)
+        log(f'{owner} is back (awx-manage answers)')
         snap = wait_for(
             f'adoption {k + 1}', lambda n=n: (h := fired_hits(peer, 'adoption.after_snapshot')) and len(h) > n and h[-1], args.claim_timeout, poll=3
         )
@@ -4855,6 +4862,10 @@ def scenario_redis_restart(containers, args):
         wait_db_events(c0, job_id, args.seam_counter)
         arm(c0, 'callback_receiver.before_read', 'pause', {'node': owner}, timeout=1800)
         time.sleep(3)
+        # Re-arming does not free the job task already paused at seam_counter: _pause polls the row by
+        # name and an armed row stays unreleased. Release it, let it wake (poll is 0.25 s), then hold at the backlog.
+        manage(c0, 'failpoint', 'release', 'callback.event')
+        time.sleep(2)
         arm(c0, 'callback.event', 'pause', {'job_id': job_id, 'node': owner, 'counter': args.seam_counter + args.seam_backlog}, timeout=1800)
         wait_hold(c0, job_id, owner, args.seam_counter + args.seam_backlog)
         m['backlog'] = redis_backlog(oc)
@@ -5568,6 +5579,55 @@ def scenario_relaunch_orphan(containers, args):
     return report(containers, a, since, args, unit_a, [f"overlap {m['overlap_s']}"], metrics=m)
 
 
+def scenario_reaped_hosts(containers, args):
+    """Jobs with no stats event (gist 5.12): a reaped job leaves its hosts showing the previous job.
+
+    1. Job A (datacheck.yml, --fail-host fails at the end) runs to completion: its hosts point at A,
+       the failing host with its failure.
+    2. Job B runs over the same hosts. Its peer is told receptor-1 is lost (heartbeat.force_lost), so
+       the lost-instance reap fails B while its playbook runs: no stats event, no host summaries.
+    3. The hosts' last job, the failure flags and the inventory counts are read before and after.
+    A defect shows as B's hosts still pointing at A (and the failure still counted) once B is over."""
+    need_two(containers, 'reaped-hosts')
+    c0 = containers[0]
+    pr = is_pr_branch(c0)
+    since = since_now()
+    manage(c0, 'failpoint', 'disarm', '--all')
+    manage(c0, 'failpoint', 'clear-hits')
+    fail_host = args.fail_host or DC_HOSTS[1]
+    iterations = args.iterations
+    inv = dc_inventory(c0)
+    args.fail_host, args.iterations = fail_host, 20
+    jt_a = dc_template(containers, args)
+    a = dc_launch(c0, jt_a)
+    wait_for('job A terminal', lambda: (s := job_state(c0, a)) and terminal(s) and s, 600, poll=5)
+    m = {'branch': 'PR' if pr else 'devel', 'job_a': a, 'fail_host': fail_host, 'inventory': inv}
+    m['hosts_after_a'] = latest_jobs_of(c0, DC_INV)
+    args.fail_host, args.iterations = '', iterations
+    jt_b = dc_template(containers, args)
+    b = dc_launch(c0, jt_b)
+    m['job_b'] = b
+    st = wait_for('B running with a work unit', lambda: (s := job_state(c0, b))['status'] == 'running' and s['work_unit_id'] and s, 300)
+    owner, unit = st['controller_node'], st['work_unit_id']
+    oc, peer, ph = peer_of(containers, owner)
+    log(f'job {b} running: controller={owner} unit={unit}; {ph} will treat receptor-1 as lost')
+    time.sleep(args.lead)
+    force_lost(peer, ph, 'receptor-1')
+    sb = wait_for('B terminal', lambda: (s := job_state(peer, b)) and terminal(s) and s, args.claim_timeout, poll=3)
+    m['b_terminal'] = {k: sb[k] for k in ('status', 'job_explanation')}
+    log(f"job {b}: {sb['status']} {sb['job_explanation']!r}")
+    manage(peer, 'failpoint', 'disarm', 'heartbeat.force_lost', check=False)
+    m['unit_end'] = unit_end(peer, b, unit, seconds=args.finish_timeout)
+    m['hosts_after_b'] = latest_jobs_of(peer, DC_INV)
+    m['inventory_after_b'] = dc_collect(peer, b)['inventories']
+    wait_for('receptor-1 ready again', lambda: instances(peer)['receptor-1']['state'] == 'ready', 300, poll=10)
+    stale = {h: v for h, v in m['hosts_after_b'].items() if v['last_job'] != b}
+    notes = [f"B {sb['status']}; hosts still pointing at an earlier job: {stale or 'none'}"]
+    ensure_up(containers)
+    time.sleep(args.settle)
+    return report(containers, b, since, args, unit, notes, metrics=m)
+
+
 def scenario_cancel_wf_orphan(containers, args):
     """Cancel a workflow while its running node's job is orphaned, in one window:
       --variant dead       owner killed, nobody told yet (PR) / before devel's reap
@@ -6216,6 +6276,9 @@ def scenario_exec_full(containers, args):
     are recorded."""
     need_two(containers, 'exec-full')
     c0, c2 = 'tools_awx_1', 'tools_awx_2'
+    # The capacity this cluster gives receptor-1 at adjustment 1.0, read before the run. A fixed 616 is
+    # only right when awx-2's CPU is forced (capacity_strand's local_settings); restore to what was there.
+    base_cap = instances(c2)['receptor-1']['capacity']
     pr = is_pr_branch(c2)
     manage(c2, 'failpoint', 'disarm', '--all')
     manage(c2, 'failpoint', 'clear-hits')
@@ -6243,7 +6306,7 @@ emit(inv.hosts.count())
     m = {'branch': 'PR' if pr else 'devel', 'iterations': args.iterations, 'hosts': args.hosts}
     try:
         set_exec_adjustment(c2, 0)
-        cap = wait_for('receptor-1 capacity lowered', lambda: (i := instances(c2)['receptor-1'])['capacity'] < 616 and i['capacity'], 240, poll=10)
+        cap = wait_for('receptor-1 capacity lowered', lambda: (i := instances(c2)['receptor-1'])['capacity'] < base_cap and i['capacity'], 240, poll=10)
         m['receptor_capacity'] = cap
         n = max(1, cap // (args.hosts + 1))
         set_instance(c2, 'awx-2', enabled=False)
@@ -6302,7 +6365,7 @@ emit(inv.hosts.count())
         if pr:
             manage(c2, 'failpoint', 'disarm', 'heartbeat.force_lost', check=False)
         start_back(c0, 'awx-1')
-    wait_for('receptor-1 capacity restored', lambda: instances(c2)['receptor-1']['capacity'] >= 616, 300, poll=10)
+    wait_for('receptor-1 capacity restored', lambda: instances(c2)['receptor-1']['capacity'] >= base_cap, 300, poll=10)
     time.sleep(args.settle)
     return report(containers, m['fillers'][0], since, args, None, [], metrics=m)
 
@@ -6921,6 +6984,7 @@ PART5 = (
     'creds-on-disk',
     'event-cleanup',
     'false-lost',
+    'reaped-hosts',
     'clock-skew',
     'mixed-versions',
 )
@@ -7026,6 +7090,7 @@ SCENARIOS = {
     'creds-on-disk': scenario_creds_on_disk,
     'event-cleanup': scenario_event_cleanup,
     'false-lost': scenario_false_lost,
+    'reaped-hosts': scenario_reaped_hosts,
     'clock-skew': scenario_clock_skew,
     'mixed-versions': scenario_mixed_versions,
     's7-cleanup': scenario_s7_cleanup,
