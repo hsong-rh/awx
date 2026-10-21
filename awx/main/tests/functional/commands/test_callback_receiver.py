@@ -44,6 +44,24 @@ def test_wrapup_skips_notifications_if_already_processed(mocker):
     notification_mock.assert_not_called()
 
 
+def test_read_hits_the_failpoint_before_it_pops_from_redis():
+    """A worker held at callback_receiver.before_read must not have popped an event yet, so the
+    backlog stays in Redis (the redis-restart resume scenario relies on that)."""
+    order = []
+    worker = CallbackBrokerWorker.__new__(CallbackBrokerWorker)
+    worker.queue_name = 'callback_tasks'
+    worker.redis = mock.Mock()
+    worker.redis.blpop.side_effect = lambda *a, **kw: order.append('pop') or None
+    with (
+        mock.patch('awx.main.dispatch.worker.callback.failpoint', side_effect=lambda name, **kw: order.append(name)),
+        mock.patch.object(CallbackBrokerWorker, 'record_statistics'),
+        mock.patch.object(CallbackBrokerWorker, 'record_read_metrics'),
+    ):
+        assert worker.read() == {'event': 'FLUSH'}
+
+    assert order == ['callback_receiver.before_read', 'pop']
+
+
 class TestCallbackBrokerWorker(TransactionTestCase):
     @pytest.fixture(autouse=True)
     def turn_off_websockets_and_redis(self, fake_redis):
