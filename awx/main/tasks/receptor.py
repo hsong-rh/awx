@@ -1711,7 +1711,10 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
         logger.exception(f'Adoption process phase failed for job {job.id} (unit={unit_id})')
         process_phase_failed = True
 
-    if receptor_job.detached:
+    # An abandoned stream also reads as detached: the processor raises when its socket is shut,
+    # and _process_phase detaches on any processor error. Checked first, the stall would always
+    # be deferred and its budget never reached.
+    if receptor_job.detached and not receptor_job.stream_stalled:
         # This controller is shutting down while the EE keeps running. The job stays 'running'
         # and the work unit stays alive, which is precisely what lets the next controller to
         # scan for orphans pick it up. Finalizing or releasing here would destroy that.

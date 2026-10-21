@@ -225,7 +225,9 @@ def test_stalled_stream_is_finalized_once_stalled_past_the_budget(adoption_env, 
     clock = FakeClock()
 
     def stalled(receptor_job, _work):
+        # The abandoned stream's processor raises, and _process_phase marks that as detached too.
         receptor_job.stream_stalled = True
+        receptor_job.detached = True
         return None
 
     with mock.patch('awx.main.tasks.receptor.AWXReceptorJob._process_phase', stalled):
@@ -253,6 +255,7 @@ def test_cut_off_stream_fails_the_job_once_cut_off_past_the_budget(adoption_env,
     def cut_off(receptor_job, _work):
         receptor_job.stream_stalled = True
         receptor_job.stream_cut_off = True
+        receptor_job.detached = True
         return None
 
     with (
