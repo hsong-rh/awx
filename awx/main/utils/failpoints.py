@@ -60,6 +60,7 @@ REGISTRY = {
     'adoption.after_snapshot': 'reattach_to_work_unit: dedup snapshot taken, before the replay starts.',
     'adoption.before_finalize': 'reattach_to_work_unit: stream finished, before hooks and the terminal status.',
     'adoption.after_finalize_before_release': 'reattach_to_work_unit: finalization done, before the work unit is released.',
+    'callback_receiver.before_read': 'Callback receiver worker: about to pop its next event from Redis. A pause here leaves the backlog in Redis.',
     'callback_receiver.before_flush': 'Callback receiver worker: about to bulk insert its buffered events.',
     'events.stats_before_insert': 'Stats event: existing host summaries read, before the insert and host metrics update.',
     'events.stats_after_insert': 'Stats event: host summaries inserted (ctx: new, metric_hosts), before the host metrics update.',
