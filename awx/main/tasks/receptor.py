@@ -1594,6 +1594,8 @@ def _finalize_adoption_result(job, callback, res, process_phase_failed, work, un
     """
     if res is not None:
         status, exit_code = _determine_adoption_status_from_res(res)
+        if res.status == 'timeout':
+            callback.delay_update(job_explanation='Job terminated due to timeout')
     elif not process_phase_failed:
         logger.info(f'Job {job.id}: adoption deferred (handled in _handle_work_error)')
         return None
