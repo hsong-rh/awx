@@ -28,11 +28,13 @@ from awx.main.tasks.receptor import (
     AWXReceptorJob,
     ReceptorWork,
     _AdoptionTask,
+    _PhaseResult,
     _CountingReader,
     _adopted_finished_at,
     _adoption_stall_budget_exhausted,
     _adoption_stall_key,
     _finalize_adopted_job,
+    _finalize_adoption_result,
     _get_adoption_exit_code,
     _get_or_create_private_data_dir,
     adopt_remote_work,
@@ -2245,3 +2247,15 @@ def test_adoption_falls_back_to_the_plain_callback_without_a_task_class():
     job._get_task_class.side_effect = NotImplementedError
 
     assert _adoption_callback_class(job) is RunnerCallback
+
+
+@patch('awx.main.tasks.receptor._finalize_adopted_job')
+@patch('awx.main.tasks.receptor.invoke_adoption_hooks', return_value=(True, None))
+def test_adopted_timeout_keeps_the_timeout_explanation(_hooks, mock_finalize):
+    """A playbook the runner timed out is failed with the same explanation a normal run gives."""
+    callback = Mock()
+
+    _finalize_adoption_result(Mock(), callback, _PhaseResult('timeout', 254), False, Mock(), 'unit', '/tmp/pdd')
+
+    callback.delay_update.assert_any_call(job_explanation='Job terminated due to timeout')
+    assert mock_finalize.call_args.kwargs['final_status'] == 'failed'
