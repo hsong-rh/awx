@@ -15,6 +15,7 @@ from awx.main.tasks.adoption_decisions import (
     mesh_hostnames,
     routed_hostnames,
     room_for_another_controllers_job,
+    drop_routed_remote_nodes,
     gate_lost_instances,
     lost_instance_disposition,
     lost_instance_job_action,
@@ -120,6 +121,25 @@ class TestGateLostInstances:
             raise AssertionError('mesh checked with nothing lost')
 
         assert gate_lost_instances([], mesh_ready) == []
+
+
+class TestDropRoutedRemoteNodes:
+    def test_routed_execution_and_hop_nodes_are_not_lost(self):
+        execution = make_instance(EXEC, node_type='execution')
+        hop = make_instance('hop-1', node_type='hop')
+        assert drop_routed_remote_nodes([execution, hop], {EXEC, 'hop-1'}) == []
+
+    def test_unrouted_remote_nodes_stay_lost(self):
+        execution = make_instance(EXEC, node_type='execution')
+        assert drop_routed_remote_nodes([execution], {PEER}) == [execution]
+
+    def test_control_nodes_are_judged_by_the_mesh_gate_not_the_route(self):
+        control = make_instance(PEER)
+        assert drop_routed_remote_nodes([control], {PEER}) == [control]
+
+    def test_unreadable_routing_table_keeps_every_lost_instance(self):
+        execution = make_instance(EXEC, node_type='execution')
+        assert drop_routed_remote_nodes([execution], None) == [execution]
 
 
 class TestLostInstanceDecisions:

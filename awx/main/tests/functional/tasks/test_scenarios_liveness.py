@@ -104,3 +104,47 @@ def test_execution_node_still_on_the_mesh_keeps_its_jobs():
 
     job.refresh_from_db()
     assert job.status == 'running'
+
+
+def routed(*nodes):
+    """Receptor status as ctrl-0 sees it, with a route to each node in nodes."""
+    return {**mesh(PEER, EXEC), 'RoutingTable': {node: {'NextHop': node, 'Cost': 1} for node in nodes}}
+
+
+@pytest.fixture
+def peer_job_on_stale_exec(peer_job):
+    """ctrl-1 is healthy and runs a job on receptor-1, whose last_seen is long past the grace period."""
+    make_cluster(peer_seconds_since_seen=0)
+    Instance.objects.filter(hostname=EXEC).update(last_seen=now() - timedelta(seconds=GRACE + 600))
+    return peer_job
+
+
+@pytest.mark.django_db
+def test_peer_job_on_execution_node_with_a_route_is_not_reaped(peer_job_on_stale_exec):
+    # 2.11 False lost-node report, another controller's job (AAP-99475). receptor-1's last_seen is
+    # stale but ctrl-0 has a route to it, so it is not lost; reaping ctrl-1's job there kills a
+    # playbook that is still running (cluster false-lost, jobs 1058 and 1059).
+    assert run_lost_instance_handling(routed(THIS, PEER, EXEC)) == []
+
+    peer_job_on_stale_exec.refresh_from_db()
+    assert peer_job_on_stale_exec.status == 'running'
+    assert peer_job_on_stale_exec.controller_node == PEER
+    assert Instance.objects.get(hostname=EXEC).node_state == 'ready'
+
+
+@pytest.mark.django_db
+def test_peer_job_on_execution_node_without_a_route_is_reaped(peer_job_on_stale_exec):
+    # The route is what keeps a node alive: with no route to receptor-1 the stale last_seen is believed.
+    assert run_lost_instance_handling(routed(THIS, PEER)) == [EXEC]
+
+    peer_job_on_stale_exec.refresh_from_db()
+    assert peer_job_on_stale_exec.status == 'failed'
+
+
+@pytest.mark.django_db
+def test_unreadable_routing_table_keeps_the_last_seen_judgement_for_an_execution_node(peer_job_on_stale_exec):
+    # No table says nothing about the node, so only the declining checks may rely on it.
+    assert run_lost_instance_handling(mesh(PEER, EXEC)) == [EXEC]
+
+    peer_job_on_stale_exec.refresh_from_db()
+    assert peer_job_on_stale_exec.status == 'failed'
