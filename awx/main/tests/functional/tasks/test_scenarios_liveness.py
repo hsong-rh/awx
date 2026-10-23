@@ -78,6 +78,24 @@ def test_controller_gone_from_the_mesh_has_its_job_adopted(peer_job):
 
 
 @pytest.mark.django_db
+def test_hung_dispatcher_control_peer_eventually_loses_its_job(peer_job, settings):
+    # A regression from cd85ff2e03 (AAP-96824). ctrl-1's receptor stays up, so it
+    # keeps its mesh connection, but its dispatcher is hung: nothing on ctrl-1 writes its
+    # last_seen or runs the health check that would mark it unavailable. Unbounded mesh
+    # presence protects it forever, unlike the slow-controller case, which is only a few
+    # missed heartbeats. Past HADR_JOB_ADOPTION_TIMEOUT the mesh must stop protecting it, so
+    # its job is taken over instead of staying stranded.
+    settings.HADR_JOB_ADOPTION_TIMEOUT = 300
+    make_cluster(peer_seconds_since_seen=GRACE + settings.HADR_JOB_ADOPTION_TIMEOUT + 60)
+
+    assert run_lost_instance_handling(mesh(PEER, EXEC)) == [PEER]
+
+    peer_job.refresh_from_db()
+    assert peer_job.status == 'running'
+    assert peer_job.controller_node == THIS
+
+
+@pytest.mark.django_db
 def test_slow_controller_job_sends_no_failed_notification(peer_job):
     # 5.15 Notification content (AAP-96848). On devel the reap of a live controller's job
     # sends a failed notification with no hosts; the job later ends successful and

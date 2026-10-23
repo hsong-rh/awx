@@ -82,6 +82,27 @@ def mesh_hostnames(mesh_status):
     return names
 
 
+def drop_mesh_connected_control_nodes(lost_instances, on_mesh, ref_time, timeout_seconds):
+    """Remove the lost control and hybrid nodes that are still on the receptor mesh.
+
+    A control node on the mesh is alive however stale its last_seen, up to timeout_seconds:
+    that is what lets a controller that only missed heartbeats keep its job. Past
+    timeout_seconds the mesh stops protecting it. A hung dispatcher keeps its mesh
+    connections but never writes its own last_seen and never runs the health check that
+    marks it unavailable, so without this bound mesh presence alone would protect it
+    forever. timeout_seconds is HADR_JOB_ADOPTION_TIMEOUT, the same bound every other
+    stalled-adoption wait already uses, so this does not add a second knob.
+
+    Execution and hop nodes pass through unaffected; drop_routed_remote_nodes judges them.
+    """
+    cutoff = ref_time - timedelta(seconds=timeout_seconds)
+    return [
+        inst
+        for inst in lost_instances
+        if inst.node_type in ('execution', 'hop') or inst.hostname not in on_mesh or inst.last_seen is None or inst.last_seen < cutoff
+    ]
+
+
 def routed_hostnames(mesh_status):
     """The nodes this node can reach right now: its routing table.
 
