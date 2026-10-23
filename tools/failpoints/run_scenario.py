@@ -5514,11 +5514,19 @@ def api(container, method, path, body=None):
 
 
 def orphan_and_decide(c0, peer, ph, owner, job_id, args, m, pr, reap_on_pr=False):
-    """Hold the owner before --seam-counter, kill it; PR: adopt (or, with reap_on_pr, reap via the
-    claim-no-queue lost path); devel: wait for the natural reap."""
-    arm_hold(c0, job_id, owner, args.seam_counter)
+    """Hold the owner before --seam-counter, kill it; PR: adopt (or, with reap_on_pr, reap the job
+    with the lost-execution-node path); devel: wait for the natural reap.
+
+    The old reap_on_pr route (adoption.before_adoption_published raising) no longer reaps: the
+    claim is handed back and the orphan sweep adopts the job. A peer that treats receptor-1 as
+    lost still reaps a running job, and the owner stays up, as in reaped-hosts."""
     if pr and reap_on_pr:
-        arm(peer, 'adoption.before_adoption_published', 'raise', {'job_id': job_id, 'node': ph}, times=1)
+        time.sleep(args.lead)
+        force_lost(peer, ph, 'receptor-1')
+        wait_for(f'job {job_id} reaped', lambda: (s := job_state(peer, job_id)) and terminal(s) and s, args.claim_timeout, poll=3)
+        manage(peer, 'failpoint', 'disarm', 'heartbeat.force_lost', check=False)
+        return
+    arm_hold(c0, job_id, owner, args.seam_counter)
     orphan_owner(peer, ph, owner, job_id, args, m, pr)
 
 
@@ -5605,15 +5613,31 @@ def scenario_reaped_hosts(containers, args):
     m['hosts_after_a'] = latest_jobs_of(c0, DC_INV)
     args.fail_host, args.iterations = '', iterations
     jt_b = dc_template(containers, args)
+    owner_killed = args.variant == 'owner-killed'
+    if owner_killed:
+        # The card's steps: B is controlled by awx-1, which is then killed and left down.
+        set_instance(c0, 'awx-2', enabled=False)
     b = dc_launch(c0, jt_b)
     m['job_b'] = b
-    st = wait_for('B running with a work unit', lambda: (s := job_state(c0, b))['status'] == 'running' and s['work_unit_id'] and s, 300)
+    m['variant'] = args.variant
+    try:
+        st = wait_for('B running with a work unit', lambda: (s := job_state(c0, b))['status'] == 'running' and s['work_unit_id'] and s, 300)
+    finally:
+        if owner_killed:
+            set_instance(c0, 'awx-2', enabled=True)
     owner, unit = st['controller_node'], st['work_unit_id']
     oc, peer, ph = peer_of(containers, owner)
-    log(f'job {b} running: controller={owner} unit={unit}; {ph} will treat receptor-1 as lost')
-    time.sleep(args.lead)
-    force_lost(peer, ph, 'receptor-1')
-    sb = wait_for('B terminal', lambda: (s := job_state(peer, b)) and terminal(s) and s, args.claim_timeout, poll=3)
+    if owner_killed:
+        log(f'job {b} running: controller={owner} unit={unit}; {owner} is killed and left down')
+        time.sleep(args.lead)
+        m['killed_at'] = kill(container_for(owner))
+        if pr:
+            force_lost(peer, ph, owner)
+    else:
+        log(f'job {b} running: controller={owner} unit={unit}; {ph} will treat receptor-1 as lost')
+        time.sleep(args.lead)
+        force_lost(peer, ph, 'receptor-1')
+    sb = wait_for('B terminal', lambda: (s := job_state(peer, b)) and terminal(s) and s, (args.finish_timeout if owner_killed else args.claim_timeout), poll=3)
     m['b_terminal'] = {k: sb[k] for k in ('status', 'job_explanation')}
     log(f"job {b}: {sb['status']} {sb['job_explanation']!r}")
     manage(peer, 'failpoint', 'disarm', 'heartbeat.force_lost', check=False)
@@ -6654,9 +6678,11 @@ ct = CredentialType.objects.get(kind='ssh', managed=True)
 c, _ = Credential.objects.get_or_create(name={CRED_NAME!r}, credential_type=ct, organization=org)
 c.inputs = {{'username': 'fp', 'ssh_key_data': key}}
 c.save()
-emit(c.id)
+emit(dict(id=c.id, needle=key.splitlines()[1]))
 ''',
     )
+    needle = cred['needle']
+    cred = cred['id']
     manage(c0, 'failpoint', 'disarm', '--all')
     manage(c0, 'failpoint', 'clear-hits')
     jt = setup(containers, 'failpoint cred', 'chatty.yml', {'iterations': args.iterations})
@@ -6687,7 +6713,13 @@ emit(c.id)
     m['owner_back_at'] = utcnow()
     time.sleep(args.observe)
     m['dirs_after'] = {container_for_host(c): private_dirs(c, job_id) for c in containers}
-    notes = [f"terminal {s['status']}; dirs after {m['dirs_after']}"]
+    # The key body itself, searched under /tmp on every controller: a leftover directory only
+    # matters if the secret is still in it.
+    m['files_with_key'] = {
+        container_for_host(c): run(['docker', 'exec', c, 'sh', '-c', f'grep -rlF -- {needle!r} /tmp 2>/dev/null'], check=False).stdout.split()
+        for c in containers
+    }
+    notes = [f"terminal {s['status']}; dirs after {m['dirs_after']}; files holding the key {m['files_with_key']}"]
     return report(containers, job_id, since, args, unit, notes, metrics=m)
 
 
@@ -7005,6 +7037,7 @@ VARIANTS = {
     'waiting-jobs': ('waiting', 'unit-unsaved'),
     'large-replay': ('peer', 'restart'),
     'data-check': ('normal', 'same-node', 'cross-node', 'slow', 'reap'),
+    'reaped-hosts': ('receptor-lost', 'owner-killed'),
     'stats-insert-race': ('streams', 'synthetic'),
     'same-hosts': ('kill', 'reap'),
     'disable-live': ('disable', 'deprovisioning'),
