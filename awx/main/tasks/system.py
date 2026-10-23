@@ -77,6 +77,7 @@ from awx.main.tasks.adoption_decisions import (
     LostInstanceAction,
     adoption_slot_available,
     execution_node_reachable,
+    drop_mesh_connected_control_nodes,
     drop_routed_remote_nodes,
     find_lost_instances,
     gate_lost_instances,
@@ -893,9 +894,10 @@ def _heartbeat_instance_management(clock=None):
     lost_instances = drop_routed_remote_nodes(lost_instances, routed_hostnames(mesh_status))
 
     if mesh_status is not None and not settings.IS_K8S:
-        # A control node still on the mesh is alive however stale its last_seen; K8s control pods are not peered.
+        # A control node still on the mesh is alive however stale its last_seen, up to
+        # HADR_JOB_ADOPTION_TIMEOUT; K8s control pods are not peered.
         on_mesh = mesh_hostnames(mesh_status)
-        lost_instances = [inst for inst in lost_instances if inst.node_type in ('execution', 'hop') or inst.hostname not in on_mesh]
+        lost_instances = drop_mesh_connected_control_nodes(lost_instances, on_mesh, nowtime, settings.HADR_JOB_ADOPTION_TIMEOUT)
 
     return this_inst, instance_list, lost_instances + forced, ctl
 

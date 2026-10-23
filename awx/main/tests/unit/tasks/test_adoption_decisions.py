@@ -15,6 +15,7 @@ from awx.main.tasks.adoption_decisions import (
     mesh_hostnames,
     routed_hostnames,
     room_for_another_controllers_job,
+    drop_mesh_connected_control_nodes,
     drop_routed_remote_nodes,
     gate_lost_instances,
     lost_instance_disposition,
@@ -140,6 +141,32 @@ class TestDropRoutedRemoteNodes:
     def test_unreadable_routing_table_keeps_every_lost_instance(self):
         execution = make_instance(EXEC, node_type='execution')
         assert drop_routed_remote_nodes([execution], None) == [execution]
+
+
+class TestDropMeshConnectedControlNodes:
+    def test_control_node_on_mesh_within_timeout_is_not_lost(self):
+        # A slow controller: a few missed heartbeats, well inside the timeout (AAP-96824).
+        slow = make_instance(PEER, seconds_since_seen=121)
+        assert drop_mesh_connected_control_nodes([slow], {PEER}, NOW, timeout_seconds=300) == []
+
+    def test_control_node_on_mesh_past_timeout_is_still_lost(self):
+        # A hung dispatcher: the mesh connection survives, but last_seen is stale far past
+        # the timeout, with nothing else to ever flip it off 'ready'.
+        hung = make_instance(PEER, seconds_since_seen=301)
+        assert drop_mesh_connected_control_nodes([hung], {PEER}, NOW, timeout_seconds=300) == [hung]
+
+    def test_control_node_off_mesh_is_lost_regardless_of_timeout(self):
+        gone = make_instance(PEER, seconds_since_seen=10)
+        assert drop_mesh_connected_control_nodes([gone], set(), NOW, timeout_seconds=300) == [gone]
+
+    def test_never_seen_control_node_on_mesh_is_lost(self):
+        never_seen = make_instance(PEER, seconds_since_seen=None)
+        assert drop_mesh_connected_control_nodes([never_seen], {PEER}, NOW, timeout_seconds=300) == [never_seen]
+
+    def test_execution_and_hop_nodes_pass_through_unaffected(self):
+        execution = make_instance(EXEC, node_type='execution', seconds_since_seen=10)
+        hop = make_instance('hop-1', node_type='hop', seconds_since_seen=10)
+        assert drop_mesh_connected_control_nodes([execution, hop], {EXEC, 'hop-1'}, NOW, timeout_seconds=300) == [execution, hop]
 
 
 class TestLostInstanceDecisions:
