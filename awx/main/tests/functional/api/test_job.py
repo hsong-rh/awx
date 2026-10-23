@@ -17,6 +17,23 @@ from awx.main.models import JobTemplate, User, Job, AdHocCommand, ProjectUpdate,
 
 
 @pytest.mark.django_db
+def test_job_detail_hides_host_map_from_job_env(get, inventory, admin_user):
+    """job_env.host_map (AAP-96843) is an internal adoption snapshot, not an API-facing value.
+
+    A large inventory makes the full map expensive to return on every GET, so the detail
+    API must strip it while the DB copy stays intact for adoption to read.
+    """
+    job = Job.objects.create(inventory=inventory, status='successful', job_env={'ANSIBLE_FOO': 'bar', 'host_map': {'host1': 1, 'host2': 2}})
+
+    r = get(job.get_absolute_url(), admin_user, expect=200)
+
+    assert 'host_map' not in r.data['job_env']
+    assert r.data['job_env']['ANSIBLE_FOO'] == 'bar'
+    job.refresh_from_db()
+    assert job.job_env['host_map'] == {'host1': 1, 'host2': 2}
+
+
+@pytest.mark.django_db
 def test_job_relaunch_permission_denied_response(post, get, inventory, project, net_credential, machine_credential):
     jt = JobTemplate.objects.create(name='testjt', inventory=inventory, project=project, ask_credential_on_launch=True)
     jt.credentials.add(machine_credential)
