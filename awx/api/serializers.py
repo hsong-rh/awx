@@ -1122,6 +1122,10 @@ class UnifiedJobSerializer(BaseSerializer):
         # Because this string is saved in the db in the source language,
         # it must be marked for translation after it is pulled from the db, not when set
         ret['job_explanation'] = _(obj.job_explanation)
+        if isinstance(ret.get('job_env'), dict) and 'host_map' in ret['job_env']:
+            # host_map (AAP-96843) is an internal adoption snapshot, not an API-facing value.
+            # A large inventory makes it expensive to return on every GET of this field.
+            ret['job_env'] = {k: v for k, v in ret['job_env'].items() if k != 'host_map'}
         return ret
 
     def get_launched_by(self, obj):
