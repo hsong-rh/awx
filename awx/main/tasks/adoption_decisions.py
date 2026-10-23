@@ -109,6 +109,19 @@ def gate_lost_instances(lost_instances, mesh_ready):
     return [inst for inst in lost_instances if inst.node_type in ('execution', 'hop')]
 
 
+def drop_routed_remote_nodes(lost_instances, routed):
+    """Remove the execution and hop nodes this node has a route to from the lost ones.
+
+    last_seen only says no controller saw a fresh advertisement lately. A route says the node is
+    there now, and reaping the jobs of a node that is there kills playbooks that still run (2.11).
+    A node that is really gone loses its route within seconds. An unreadable routing table
+    (None) says nothing, so the last_seen judgement stands.
+    """
+    if routed is None:
+        return list(lost_instances)
+    return [inst for inst in lost_instances if inst.node_type not in ('execution', 'hop') or inst.hostname not in routed]
+
+
 def execution_node_reachable(execution_node, routed):
     """Does this node have a route to the job's execution node?
 

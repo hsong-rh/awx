@@ -77,6 +77,7 @@ from awx.main.tasks.adoption_decisions import (
     LostInstanceAction,
     adoption_slot_available,
     execution_node_reachable,
+    drop_routed_remote_nodes,
     find_lost_instances,
     gate_lost_instances,
     live_controller_hostnames,
@@ -889,6 +890,7 @@ def _heartbeat_instance_management(clock=None):
             return None, None, None, None
 
     lost_instances = gate_lost_instances(lost_instances, lambda: _mesh_all_ready_nodes_visible(mesh_status))
+    lost_instances = drop_routed_remote_nodes(lost_instances, routed_hostnames(mesh_status))
 
     if mesh_status is not None and not settings.IS_K8S:
         # A control node still on the mesh is alive however stale its last_seen; K8s control pods are not peered.
