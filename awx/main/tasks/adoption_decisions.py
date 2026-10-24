@@ -158,14 +158,14 @@ def lost_instance_job_action(job, lost_hostname, slot_available, route_available
     A job dispatched to receptor whose controller was lost is adopted if its playbook ran on
     another node, which outlived the controller. It is deferred instead when this controller
     has no room or no route to its execution node: it stays owned by the lost controller, so
-    another controller's orphan sweep still finds it. A job that never reached an execution environment goes back to pending.
-    Anything else is reaped.
+    another controller's orphan sweep still finds it. A job that never reached an execution environment goes back to pending,
+    and so does a started job of the lost controller that has no work unit, unless a cancel was requested. Anything else is reaped.
 
     slot_available and route_available are callables, asked only for a job that would be adopted.
     """
     if job.work_unit_id and job.controller_node == lost_hostname and job.execution_node != lost_hostname:
         return JobAction.ADOPT if route_available() and slot_available() else JobAction.DEFER
-    if not job.started and not job.work_unit_id:
+    if not job.work_unit_id and (not job.started or (job.controller_node == lost_hostname and not getattr(job, 'cancel_flag', False))):
         return JobAction.REQUEUE
     return JobAction.REAP
 
