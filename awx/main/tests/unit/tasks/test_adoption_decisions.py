@@ -202,7 +202,8 @@ class TestLostInstanceDecisions:
     @pytest.mark.parametrize(
         'job_fields',
         [
-            {'controller_node': PEER, 'work_unit_id': ''},  # started, but never dispatched to receptor
+            {'controller_node': PEER, 'work_unit_id': '', 'cancel_flag': True},  # a user cancel must not be undone
+            {'controller_node': ME, 'work_unit_id': ''},  # started without a work unit, but the lost node did not control it
             {'controller_node': PEER, 'execution_node': PEER},  # the lost node ran the playbook too
             {'controller_node': ME, 'execution_node': PEER},  # only the execution node was lost
         ],
@@ -210,11 +211,17 @@ class TestLostInstanceDecisions:
     def test_job_that_cannot_be_adopted_is_reaped(self, job_fields):
         assert self.decide(make_job(**job_fields)) == JobAction.REAP
 
+    @pytest.mark.parametrize('work_unit_id', ['', None])
+    def test_started_job_that_never_got_a_work_unit_goes_back_to_pending(self, work_unit_id):
+        # Claimed during the controller's death, before any work unit existed: nothing reached an
+        # execution environment, so a re-dispatch cannot collide with partial work.
+        assert self.decide(make_job(controller_node=PEER, work_unit_id=work_unit_id)) == JobAction.REQUEUE
+
     def test_capacity_is_asked_only_for_a_job_that_would_be_adopted(self):
         def slot_available():
             raise AssertionError('capacity was read for a job that is reaped anyway')
 
-        assert lost_instance_job_action(make_job(controller_node=PEER, work_unit_id=''), PEER, slot_available) == JobAction.REAP
+        assert lost_instance_job_action(make_job(controller_node=PEER, work_unit_id='', cancel_flag=True), PEER, slot_available) == JobAction.REAP
 
     @pytest.mark.parametrize(
         'node_type, node_state, auto_deprovision, expected',
