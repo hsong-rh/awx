@@ -255,7 +255,7 @@ def delete_job_pod(job, pod_name):
 # ---------------------------------------------------------------------------
 
 
-def requeue_wedged_job(job):
+def requeue_wedged_job(job, reason='pod never received its private data dir'):
     """Hand a wedged job back to the task manager for a clean re-dispatch.
 
     Safe precisely because a wedged worker never got its private data dir and therefore never
@@ -274,7 +274,7 @@ def requeue_wedged_job(job):
         execution_node='',
     )
     if updated:
-        logger.warning(f'{job.log_format}: pod never received its private data dir; requeued for re-dispatch')
+        logger.warning(f'{job.log_format}: {reason}; requeued for re-dispatch')
     return bool(updated)
 
 
@@ -477,6 +477,9 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None, clock=
         return True
 
     if state == PodState.ABSENT:
+        if not job.work_unit_id and not job.cancel_flag:
+            # The controller died before it created the pod, so nothing ran and nothing will appear.
+            return requeue_wedged_job(job, reason='controller died before creating the pod')
         if not budget_exhausted(job, 'pod_absent', clock=clock):
             # The pod may simply not have been created yet when the controller died.
             logger.info(f'{job.log_format}: no container-group pod found yet, deferring adoption')

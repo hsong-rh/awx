@@ -955,6 +955,10 @@ def _handle_lost_instance_job(j, other_inst):
             return
 
     if action != JobAction.ADOPT:
+        logger.warning(
+            f'Reaping job {j.id} of lost instance {other_inst.hostname}: controller={j.controller_node!r} execution_node={j.execution_node!r} '
+            f'work_unit_id={j.work_unit_id!r} started={j.started} cancel_flag={j.cancel_flag}'
+        )
         reaper.reap_job(j, 'failed', job_explanation='Job reaped due to instance shutdown')
         return
 
