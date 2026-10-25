@@ -368,6 +368,44 @@ def test_absent_pod_past_budget_fails_the_job(adoption_env):
     assert adoption_env['budget_exhausted'].call_args[0][1] == 'pod_absent', 'an absent pod needs its own stall clock'
 
 
+@pytest.mark.parametrize('work_unit_id', ['', None])
+def test_absent_pod_of_a_job_that_never_got_a_work_unit_is_requeued(adoption_env, work_unit_id):
+    """The controller died before it created the pod, so nothing ran and nothing will appear."""
+    adoption_env['find_job_pod'].return_value = None
+    adoption_env['classify_job_pod'].return_value = PodState.ABSENT
+    adoption_env['requeue_wedged_job'].return_value = True
+    job = _job()
+    job.work_unit_id = work_unit_id
+    job.cancel_flag = False
+
+    assert adopt_container_group_job(job) is True
+    adoption_env['requeue_wedged_job'].assert_called_once()
+    adoption_env['reap_job'].assert_not_called()
+
+
+def test_absent_pod_of_a_job_with_a_work_unit_still_waits_for_the_deadline(adoption_env):
+    adoption_env['find_job_pod'].return_value = None
+    adoption_env['classify_job_pod'].return_value = PodState.ABSENT
+    job = _job()
+    job.work_unit_id = 'unit-1'
+    job.cancel_flag = False
+
+    assert adopt_container_group_job(job) is False
+    adoption_env['requeue_wedged_job'].assert_not_called()
+
+
+def test_absent_pod_of_a_canceled_job_is_not_requeued(adoption_env):
+    # A user cancel must not be undone by putting the job back in the queue.
+    adoption_env['find_job_pod'].return_value = None
+    adoption_env['classify_job_pod'].return_value = PodState.ABSENT
+    job = _job()
+    job.work_unit_id = None
+    job.cancel_flag = True
+
+    assert adopt_container_group_job(job) is False
+    adoption_env['requeue_wedged_job'].assert_not_called()
+
+
 def test_waiting_pod_defers_without_touching_the_job(adoption_env):
     adoption_env['classify_job_pod'].return_value = PodState.WAITING
 

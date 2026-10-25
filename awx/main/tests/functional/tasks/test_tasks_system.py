@@ -698,12 +698,11 @@ class TestReapAndMarkLostInstance:
         mock_adopt.apply_async.assert_not_called()
         mock_reaper.reap_job.assert_called_once()
 
-    def test_reap_reaped_undispatched_jobs_when_lost_instance(self, settings):
-        """Jobs without work_unit_id are reaped immediately, not adopted."""
+    def test_undispatched_jobs_of_a_lost_instance_go_back_to_pending(self, settings):
+        """Jobs without work_unit_id have nothing to adopt; they are re-queued, not reaped."""
         settings.AWX_AUTO_DEPROVISION_INSTANCES = False
         inst = self._inst(hostname='ctrl-lost')
-        # Undispatched job (no work_unit_id) — should be reaped
-        Job.objects.create(
+        job = Job.objects.create(
             controller_node=inst.hostname,
             status='running',
             work_unit_id=None,
@@ -713,8 +712,9 @@ class TestReapAndMarkLostInstance:
 
         # Adoption should NOT be queued
         mock_adopt.apply_async.assert_not_called()
-        # Job should be reaped
-        mock_reaper.reap_job.assert_called_once()
+        mock_reaper.reap_job.assert_not_called()
+        job.refresh_from_db()
+        assert job.status == 'pending'
 
     def test_database_error_with_sqlstate_logs_details(self, settings):
         settings.AWX_AUTO_DEPROVISION_INSTANCES = False
@@ -2115,12 +2115,12 @@ class TestLostInstanceCapacity:
         assert observed['owner_at_check'] == lost.hostname
 
     def test_an_unadoptable_job_is_still_reaped_when_full(self, me_inst, settings):
-        """A job with no work unit has nothing to stream and is not the sweep's business either.
+        """A canceled job with no work unit has nothing to stream and is not the sweep's business either.
         The capacity check must sit after the adoptable test, or a full controller would quietly
         leave un-adoptable jobs running forever."""
         settings.CLUSTER_HOST_ID = me_inst.hostname
         lost = self._lost()
-        job = self._job(lost, work_unit_id='')
+        job = self._job(lost, work_unit_id='', cancel_flag=True)
 
         with (
             patch('awx.main.tasks.system._room_for_another_controllers_job', return_value=False),
@@ -2249,13 +2249,26 @@ class TestLostInstanceCapacity:
         assert job.status == 'error', 'must not overwrite a terminal status back to pending'
         reap_job.assert_called_once()
 
-    def test_started_but_unadoptable_job_is_still_reaped(self, me_inst, settings):
-        """A job that started (has a started time) but has no work_unit_id is genuinely
-        broken — there's nothing to reconnect to. It must still be reaped."""
+    def test_started_job_without_a_work_unit_goes_back_to_pending(self, me_inst, settings):
+        """A job that started but never got a work_unit_id reached no execution environment,
+        so there is nothing to reconnect to and nothing to collide with: it is re-queued."""
         settings.CLUSTER_HOST_ID = me_inst.hostname
         lost = self._lost()
         job = self._job(lost, work_unit_id='')
         # started is auto-set by the model save — so this job has a started time
+
+        with patch('awx.main.tasks.system.reaper.reap_job') as reap_job:
+            _handle_lost_instance_job(job, lost)
+
+        job.refresh_from_db()
+        assert job.status == 'pending'
+        reap_job.assert_not_called()
+
+    def test_canceled_started_job_without_a_work_unit_is_reaped(self, me_inst, settings):
+        """A user cancel must not be undone by putting the job back in the queue."""
+        settings.CLUSTER_HOST_ID = me_inst.hostname
+        lost = self._lost()
+        job = self._job(lost, work_unit_id='', cancel_flag=True)
 
         with patch('awx.main.tasks.system.reaper.reap_job') as reap_job:
             _handle_lost_instance_job(job, lost)
