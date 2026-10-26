@@ -383,6 +383,20 @@ def test_absent_pod_of_a_job_that_never_got_a_work_unit_is_requeued(adoption_env
     adoption_env['reap_job'].assert_not_called()
 
 
+def test_absent_pod_of_a_sync_job_is_reaped_not_requeued(adoption_env):
+    # The task manager never dispatches launch_type='sync', so a requeued one would sit pending forever.
+    adoption_env['find_job_pod'].return_value = None
+    adoption_env['classify_job_pod'].return_value = PodState.ABSENT
+    job = _job()
+    job.work_unit_id = ''
+    job.cancel_flag = False
+    job.launch_type = 'sync'
+
+    assert adopt_container_group_job(job) is True
+    adoption_env['requeue_wedged_job'].assert_not_called()
+    assert adoption_env['reap_job'].call_args[0][1] == 'failed'
+
+
 def test_absent_pod_of_a_job_with_a_work_unit_still_waits_for_the_deadline(adoption_env):
     adoption_env['find_job_pod'].return_value = None
     adoption_env['classify_job_pod'].return_value = PodState.ABSENT

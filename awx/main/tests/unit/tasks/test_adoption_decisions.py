@@ -217,6 +217,11 @@ class TestLostInstanceDecisions:
         # execution environment, so a re-dispatch cannot collide with partial work.
         assert self.decide(make_job(controller_node=PEER, work_unit_id=work_unit_id)) == JobAction.REQUEUE
 
+    @pytest.mark.parametrize('job_fields', [{'started': None}, {'controller_node': PEER}])
+    def test_sync_job_is_reaped_not_requeued(self, job_fields):
+        # The task manager never dispatches launch_type='sync', so a requeued one would sit pending forever.
+        assert self.decide(make_job(work_unit_id='', launch_type='sync', **job_fields)) == JobAction.REAP
+
     def test_capacity_is_asked_only_for_a_job_that_would_be_adopted(self):
         def slot_available():
             raise AssertionError('capacity was read for a job that is reaped anyway')
@@ -367,6 +372,10 @@ class TestRunningJobAction:
         # It was claimed during a controller kill, before any work unit existed, so nothing
         # reached an execution environment and a re-dispatch cannot collide with partial work.
         assert self.decide(make_job(work_unit_id=work_unit_id, execution_node='')) == JobAction.REQUEUE
+
+    def test_running_sync_orphan_without_a_work_unit_is_reaped(self):
+        # The task manager never dispatches launch_type='sync', so a requeued one would sit pending forever.
+        assert self.decide(make_job(work_unit_id='', execution_node='', launch_type='sync')) == JobAction.REAP
 
     def test_orphan_this_instance_only_executes_is_left_to_the_sweep(self):
         # A dispatched job this instance only executes, for a controller that isn't live: this

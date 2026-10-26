@@ -2944,6 +2944,50 @@ def scenario_exec_node_dies(containers, args):
     return report(containers, job_id, since, args, unit, notes, metrics=m, from_logs=lambda logs: {'log_counts': count_log_lines(logs, job_id, unit)})
 
 
+def scenario_exec_node_frozen(containers, args):
+    """Exec node frozen while its job runs; the owner controller stays alive.
+
+    A frozen node keeps its route, so the 2.11 route check does not call it lost and the owner
+    keeps the job. --variant hang: the template has no timeout, so only the node decides.
+    --variant timeout: the template has --job-timeout, which should end the job while frozen.
+    Watches --observe seconds with the node paused, unpauses it, then cancels a job still running.
+    """
+    need_two(containers, 'exec-node-frozen')
+    c0 = containers[0]
+    pr = 'sweep.before_claim' in registry(c0)
+    since = since_now()
+    jt_fields = {'timeout': args.job_timeout} if args.variant == 'timeout' else None
+    job_id, st = start_job(containers, args, jt_fields=jt_fields)
+    owner, unit = st['controller_node'], st['work_unit_id']
+    oc, peer, ph = peer_of(containers, owner)
+    m = {'owner': owner, 'peer': ph, 'variant': args.variant, 'branch': 'PR' if pr else 'devel'}
+    notes = [f"exec-node-frozen {args.variant} on {m['branch']}: owner {owner}, unit {unit}"]
+    m['frozen_at'] = utcnow()
+    run(['docker', 'pause', EXEC_CONTAINER])
+    log(f'{EXEC_CONTAINER} paused; job {job_id} runs there with owner {owner} alive')
+    try:
+        s = watch(oc, job_id, unit, args.observe, until=terminal, poll=30)
+        m['route_on_owner_after_pause'] = mesh_sees(oc, 'receptor-1')
+    finally:
+        run(['docker', 'unpause', EXEC_CONTAINER])
+    m['unpaused_at'] = utcnow()
+    if not terminal(s):
+        m['stranded'] = f"still {s['status']} {args.observe}s after the pause (controller {s['controller_node']}, {s['events']} events)"
+        notes.append(m['stranded'])
+        log(m['stranded'])
+        s = watch(oc, job_id, unit, 120, until=terminal, poll=10)
+    if not terminal(s):
+        res = cancel_job(oc, job_id)
+        notes.append(f'canceled to clean up at {res["at"]}')
+        s = watch(oc, job_id, unit, 300, until=terminal, poll=10)
+    m['final_status'] = s['status']
+    m['final_explanation'] = s['job_explanation']
+    m['unit_end'] = unit_status(unit)
+    ensure_up(containers)
+    time.sleep(args.settle)
+    return report(containers, job_id, since, args, unit, notes, metrics=m, from_logs=lambda logs: {'log_counts': count_log_lines(logs, job_id, unit)})
+
+
 def scenario_job_timeout(containers, args):
     """Job timeout while orphaned: a template with timeout=--job-timeout, orphaned partway through.
 
@@ -7031,6 +7075,7 @@ VARIANTS = {
     'mesh-cut': ('adopt', 'own-job'),
     'both-controllers-lost': ('peer-returns', 'owner-returns'),
     'exec-node-dies': ('restart', 'kill-start'),
+    'exec-node-frozen': ('hang', 'timeout'),
     'job-timeout': ('kill', 'none'),
     'fact-cache': ('kill', 'none'),
     'other-job-types': ('adhoc', 'project-update', 'inventory-update'),
@@ -7078,6 +7123,7 @@ SCENARIOS = {
     'claim-no-queue': scenario_claim_no_queue,
     'both-controllers-lost': scenario_both_controllers_lost,
     'exec-node-dies': scenario_exec_node_dies,
+    'exec-node-frozen': scenario_exec_node_frozen,
     'job-timeout': scenario_job_timeout,
     'fact-cache': scenario_fact_cache,
     'set-stats-artifacts': scenario_set_stats_artifacts,

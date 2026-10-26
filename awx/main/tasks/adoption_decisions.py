@@ -152,6 +152,11 @@ def execution_node_reachable(execution_node, routed):
     return not execution_node or routed is None or execution_node in routed
 
 
+def is_requeueable(job):
+    """The task manager never dispatches launch_type='sync' (inline project/inventory updates), so a requeued one stays pending forever."""
+    return getattr(job, 'launch_type', None) != 'sync'
+
+
 def lost_instance_job_action(job, lost_hostname, slot_available, route_available=lambda: True):
     """What to do with a running job whose controller or execution node was lost.
 
@@ -165,7 +170,7 @@ def lost_instance_job_action(job, lost_hostname, slot_available, route_available
     """
     if job.work_unit_id and job.controller_node == lost_hostname and job.execution_node != lost_hostname:
         return JobAction.ADOPT if route_available() and slot_available() else JobAction.DEFER
-    if not job.work_unit_id and (not job.started or (job.controller_node == lost_hostname and not getattr(job, 'cancel_flag', False))):
+    if is_requeueable(job) and not job.work_unit_id and (not job.started or (job.controller_node == lost_hostname and not getattr(job, 'cancel_flag', False))):
         return JobAction.REQUEUE
     return JobAction.REAP
 
@@ -257,7 +262,7 @@ def running_job_action(job, this_hostname, active_task_ids, ref_time, workflow_c
         return JobAction.SKIP
     if job.work_unit_id and job.controller_node == this_hostname:
         return JobAction.ADOPT
-    if not job.work_unit_id and job.controller_node == this_hostname and not getattr(job, 'cancel_flag', False):
+    if is_requeueable(job) and not job.work_unit_id and job.controller_node == this_hostname and not getattr(job, 'cancel_flag', False):
         # Claimed by this controller but never given a work unit, e.g. it was swept from a killed
         # controller before dispatch got that far. Nothing reached an EE, so run it again.
         return JobAction.REQUEUE
