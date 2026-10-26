@@ -34,6 +34,7 @@ from awx.main.dispatch.reaper import reap_job
 from awx.main.models import UnifiedJob
 from awx.main.scheduler.kubernetes import PodManager
 from awx.main.tasks.adoption import invoke_adoption_hooks
+from awx.main.tasks.adoption_decisions import is_requeueable
 from awx.main.tasks.receptor import (
     ReceptorWork,
     AWXReceptorJob,
@@ -479,6 +480,9 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None, clock=
     if state == PodState.ABSENT:
         if not job.work_unit_id and not job.cancel_flag:
             # The controller died before it created the pod, so nothing ran and nothing will appear.
+            if not is_requeueable(job):
+                reap_job(job, 'failed', job_explanation='Job pod was never created before its controller was lost.')
+                return True
             return requeue_wedged_job(job, reason='controller died before creating the pod')
         if not budget_exhausted(job, 'pod_absent', clock=clock):
             # The pod may simply not have been created yet when the controller died.
