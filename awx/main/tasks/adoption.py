@@ -100,24 +100,6 @@ def _build_hook_error_info(exc, hook_start_time):
     }
 
 
-def _override_job_env(job, private_data_dir):
-    """Temporarily override job's AWX_PRIVATE_DATA_DIR for hook execution.
-
-    Saves the override to the database so that refresh_from_db() calls inside
-    post_run_hook see the adoption private_data_dir rather than the original
-    controller's (now-deleted) path. Returns the original env dict; caller
-    must restore it to job.job_env and save in a finally block.
-    """
-    job.refresh_from_db(fields=['job_env'])
-    original_env = dict(job.job_env or {})
-
-    job.job_env = dict(original_env)
-    job.job_env['AWX_PRIVATE_DATA_DIR'] = private_data_dir
-    job.save(update_fields=['job_env'])
-
-    return original_env
-
-
 def invoke_adoption_hooks(job, callback, private_data_dir, status):
     """Call post-run hook for a job during adoption, if applicable.
 
@@ -162,20 +144,14 @@ def invoke_adoption_hooks(job, callback, private_data_dir, status):
         task_instance = task_class()
         task_instance.instance = job
         task_instance.runner_callback = callback
+        # post_run_hook reads this instead of job_env['AWX_PRIVATE_DATA_DIR'], which still names
+        # the lost controller's deleted directory and is never rewritten here.
         task_instance.private_data_dir = private_data_dir
 
-        original_env = _override_job_env(job, private_data_dir)
-        try:
-            task_instance.post_run_hook(job, status)
-            elapsed = time.time() - hook_start_time
-            logger.info(f'Job {job.id}: adoption hook succeeded in {elapsed:.2f}s')
-            return True, None
-        finally:
-            job.job_env = original_env
-            try:
-                job.save(update_fields=['job_env'])
-            except Exception:
-                logger.warning(f'Job {job.id}: failed to restore job_env after adoption hook', exc_info=True)
+        task_instance.post_run_hook(job, status)
+        elapsed = time.time() - hook_start_time
+        logger.info(f'Job {job.id}: adoption hook succeeded in {elapsed:.2f}s')
+        return True, None
 
     except Exception as exc:
         error_info = _build_hook_error_info(exc, hook_start_time)

@@ -4,6 +4,7 @@ Tests the full hook condition evaluation and artifact validation with database o
 """
 
 import pytest
+from django.utils import timezone
 
 from awx.main.models import Organization
 from awx.main.models.inventory import Inventory, InventorySource, InventoryUpdate
@@ -346,6 +347,30 @@ def test_invoke_adoption_hooks_inventory_update_with_artifacts(tmp_path):
     succeeded, error = invoke_adoption_hooks(iu, callback, str(tmp_path), 'successful')
     # With valid artifacts, hook should attempt to execute
     assert isinstance(succeeded, bool)
+
+
+@pytest.mark.django_db
+def test_invoke_adoption_hooks_inventory_update_reads_adoption_dir_and_leaves_job_env(tmp_path):
+    """The hook reads output.json from the adoption directory even though job_env still names
+    the lost controller's directory, and job_env in the database is not rewritten."""
+    from unittest.mock import Mock
+    from awx.main.tasks.adoption import invoke_adoption_hooks
+
+    org = Organization.objects.create(name='test_org')
+    inventory = Inventory.objects.create(name='test_inv', organization=org)
+    inv_source = InventorySource.objects.create(name='aws', inventory=inventory, source='ec2')
+    stale_env = {'AWX_PRIVATE_DATA_DIR': '/lost/controller/dir', 'host_map': {'h1': 1}}
+    iu = InventoryUpdate.objects.create(inventory_source=inv_source, source='ec2', inventory=inventory, job_env=stale_env, started=timezone.now())
+
+    artifacts_dir = tmp_path / 'artifacts' / str(iu.id)
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / 'output.json').write_text('{"all": {"hosts": {}}}')
+
+    succeeded, error = invoke_adoption_hooks(iu, Mock(event_ct=0, end_line=0), str(tmp_path), 'successful')
+
+    assert succeeded is True, error
+    iu.refresh_from_db()
+    assert iu.job_env == stale_env
 
 
 @pytest.mark.django_db

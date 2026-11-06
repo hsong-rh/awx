@@ -1455,8 +1455,11 @@ class RunJob(SourceControlMixin, BaseTask):
 
     def post_run_hook(self, job, status):
         super(RunJob, self).post_run_hook(job, status)
-        job.refresh_from_db(fields=['job_env'])
-        private_data_dir = job.job_env.get('AWX_PRIVATE_DATA_DIR')
+        # Adoption sets self.private_data_dir; a normal run only sets it after this hook.
+        private_data_dir = getattr(self, 'private_data_dir', None)
+        if not private_data_dir:
+            job.refresh_from_db(fields=['job_env'])
+            private_data_dir = job.job_env.get('AWX_PRIVATE_DATA_DIR')
         if not private_data_dir:
             # If there's no private data dir, that means we didn't get into the
             # actual `run()` call; this _usually_ means something failed in
@@ -2136,7 +2139,7 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
             return  # nothing to save, step out of the way to allow error reporting
 
         inventory_update.refresh_from_db()
-        private_data_dir = inventory_update.job_env['AWX_PRIVATE_DATA_DIR']
+        private_data_dir = getattr(self, 'private_data_dir', None) or inventory_update.job_env['AWX_PRIVATE_DATA_DIR']
         expected_output = os.path.join(private_data_dir, 'artifacts', str(inventory_update.id), 'output.json')
         with open(expected_output) as f:
             data = json.load(f)

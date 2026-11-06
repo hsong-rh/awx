@@ -272,18 +272,56 @@ def test_hook_captures_post_run_error():
     assert error['traceback'] == 'traceback content'
 
 
-def test_hook_restores_job_env_on_exception(tmp_path):
-    """Verify job_env is restored even when exception occurs."""
+def test_hook_hands_private_data_dir_to_the_task_without_writing_job_env(tmp_path):
+    """The hook gets the adoption directory from the task, so job_env, which can hold the
+    whole host map, is neither read nor written."""
     job = _make_mock_job(ProjectUpdate)
     job.job_env = {'ORIGINAL': 'value'}
     task_class = Mock()
     task_class.__name__ = 'RunProjectUpdate'
-    task_class.return_value.post_run_hook.side_effect = RuntimeError('Test')
     job._get_task_class.return_value = task_class
-    callback = Mock()
     job.refresh_from_db = Mock()
+    job.save = Mock()
 
-    invoke_adoption_hooks(job, callback, str(tmp_path), 'successful')
+    hook_succeeded, _ = invoke_adoption_hooks(job, Mock(), str(tmp_path), 'successful')
 
-    # job_env should be restored to original
+    assert hook_succeeded is True
+    assert task_class.return_value.private_data_dir == str(tmp_path)
     assert job.job_env == {'ORIGINAL': 'value'}
+    job.refresh_from_db.assert_not_called()
+    job.save.assert_not_called()
+
+
+def _run_job_hook(tmp_path, task_private_data_dir=None, job_env_dir=None):
+    """Run RunJob.post_run_hook with the fact cache on and return the finish_fact_cache mock."""
+    from unittest.mock import patch
+    from awx.main.tasks import jobs
+
+    job = _make_mock_job(Job, inventory_id=1)
+    job.inventory.kind = 'static'
+    job.job_env = {'AWX_PRIVATE_DATA_DIR': job_env_dir} if job_env_dir else {}
+    task = jobs.RunJob()
+    task.runner_callback = Mock(artifacts_processed=True)
+    task.should_use_fact_cache = lambda: True
+    if task_private_data_dir:
+        task.private_data_dir = task_private_data_dir
+
+    with patch.object(jobs, 'finish_fact_cache') as finish_fact_cache:
+        task.post_run_hook(job, 'successful')
+    return job, finish_fact_cache
+
+
+def test_run_job_hook_prefers_the_task_private_data_dir(tmp_path):
+    """Adoption names its own directory, and job_env is not read for it."""
+    job, finish_fact_cache = _run_job_hook(tmp_path, task_private_data_dir=str(tmp_path), job_env_dir='/gone')
+
+    job.refresh_from_db.assert_not_called()
+    assert finish_fact_cache.call_args[1]['artifacts_dir'].startswith(str(tmp_path))
+
+
+def test_run_job_hook_falls_back_to_job_env_on_a_normal_run(tmp_path):
+    """A normal run sets self.private_data_dir only after the hook, so job_env stays the source."""
+    job, finish_fact_cache = _run_job_hook(tmp_path, job_env_dir=str(tmp_path))
+
+    job.refresh_from_db.assert_called_once_with(fields=['job_env'])
+    assert finish_fact_cache.call_args[1]['artifacts_dir'].startswith(str(tmp_path))
