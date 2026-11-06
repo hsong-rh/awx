@@ -1,3 +1,4 @@
+from datetime import timedelta
 from unittest import mock
 
 import pytest
@@ -158,10 +159,16 @@ def test_playbook_events_complete_without_final_event(job, status, cancel_flag, 
 
 @pytest.mark.django_db
 def test_playbook_events_complete_counts_duplicates_once(job):
-    for i in (1, 2, 2, 3, 3):
+    """Without the (job, counter, job_created) unique constraint, as on devel, a counter can be stored
+    twice and must count once. The constraint allows these rows because they differ by job_created, and
+    the event queryset is not narrowed by job_created, as it is not for a job with unpartitioned events."""
+    for i in (1, 2, 3):
         _event(job, i)
+    for i in (2, 3):
+        JobEvent.objects.create(job=job, counter=i, event='runner_on_ok', job_created=job.created + timedelta(microseconds=1))
     _event(job, 4, event='playbook_on_stats')
-    result = job_invariants.check_playbook_events_complete(job)
+    with mock.patch.object(Job, 'get_event_queryset', lambda self: JobEvent.objects.filter(job_id=self.id)):
+        result = job_invariants.check_playbook_events_complete(job)
     assert result['ok'], result
     assert '4 of 4 stored' in result['detail']
 
