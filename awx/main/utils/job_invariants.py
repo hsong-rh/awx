@@ -132,7 +132,9 @@ def check_host_ids_match_job_start(job):
     orphan window re-points replayed events and summaries. Expected, per host in the
     job-start map:
 
-    - events: exactly the job-start id;
+    - events: the job-start id if that host still exists, else the job-start id or None (the
+      callback receiver nulls the id of a host deleted before a batch is saved, so a deleted
+      host can carry both: the job-start id before the delete, None after it);
     - summaries: the job-start id if that host still exists, else None (a normal run nulls
       ids of hosts deleted before the stats event, and the foreign key nulls them after).
 
@@ -157,11 +159,15 @@ def check_host_ids_match_job_start(job):
         }
 
     expected = {name: _host_id(value) for name, value in snapshot.items()}
-    bad_events = sorted(f'{name} {sorted(ids, key=str)} != {expected[name]}' for name, ids in seen.items() if name in expected and ids != {expected[name]})
+    existing = set(Host.objects.filter(pk__in=[i for i in expected.values() if i is not None]).values_list('pk', flat=True))
+    bad_events = sorted(
+        f'{name} {sorted(ids, key=str)} != {expected[name]}'
+        for name, ids in seen.items()
+        if name in expected and not ids <= ({expected[name]} if expected[name] in existing else {expected[name], None})
+    )
 
     bad_summaries = []
     if job.inventory_id and job.inventory.kind != 'constructed':
-        existing = set(Host.objects.filter(pk__in=[i for i in expected.values() if i is not None]).values_list('pk', flat=True))
         for name, host_id in job.job_host_summaries.values_list('host_name', 'host_id'):
             if name not in expected:
                 continue

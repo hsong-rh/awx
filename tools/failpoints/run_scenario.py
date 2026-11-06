@@ -1711,16 +1711,21 @@ def scenario_host_map(containers, args):
     a = hostmap_analysis(peer, job_id, original, thr)
     print('\n=== Host map analysis ===')
     print(f"  original ids: {a['original']}; adoption safe_threshold={a['threshold']}")
+    existing = set(a['existing'])
+
+    def event_tag(r):
+        # The callback receiver nulls the id of a host deleted before the batch is saved, so a
+        # deleted host's events may carry None as well as the original id.
+        orig_id = original.get(r['host_name'])
+        return 'original' if r['host_id'] == orig_id or (r['host_id'] is None and orig_id not in existing) else 'NOT ORIGINAL'
+
     print('  events by (host_name, host_id): ')
     for r in a['events_by_host']:
-        tag = 'original' if original.get(r['host_name']) == r['host_id'] else 'NOT ORIGINAL'
-        print(f"    {r['host_name']:<6} host_id={r['host_id']!s:<6} n={r['n']:<4} counters {r['lo']}-{r['hi']}  {tag}")
+        print(f"    {r['host_name']:<6} host_id={r['host_id']!s:<6} n={r['n']:<4} counters {r['lo']}-{r['hi']}  {event_tag(r)}")
     print('  events above the snapshot threshold (replayed by adoption):')
     for r in a['events_above_threshold']:
-        tag = 'original' if original.get(r['host_name']) == r['host_id'] else 'NOT ORIGINAL'
-        print(f"    {r['host_name']:<6} host_id={r['host_id']!s:<6} n={r['n']:<4} {tag}")
+        print(f"    {r['host_name']:<6} host_id={r['host_id']!s:<6} n={r['n']:<4} {event_tag(r)}")
     print('  job host summaries:')
-    existing = set(a['existing'])
     for r in a['summaries']:
         orig_id = original.get(r['host_name'])
         # A summary nulls host_id when that host has since been deleted (on_delete=SET_NULL,

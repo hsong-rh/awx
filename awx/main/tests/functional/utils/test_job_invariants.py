@@ -50,7 +50,8 @@ def test_host_ids_match_when_events_and_summaries_use_job_start_ids(job, hosts):
 
 @pytest.mark.django_db
 def test_host_ids_flag_replayed_events_with_rebuilt_map(job, hosts, inventory):
-    """The host-map drift seen in adoption: a recreated host gets the new id, a deleted one None."""
+    """The host-map drift seen in adoption: a recreated host gets the new id. A deleted host's
+    events may carry its job-start id and None, so only h3 is flagged."""
     snap = _snapshot(hosts)
     h1, h2, h3 = hosts
     _event(job, 1, host=h1)
@@ -64,7 +65,25 @@ def test_host_ids_flag_replayed_events_with_rebuilt_map(job, hosts, inventory):
     _set_host_map_snapshot(job, snap)
     result = job_invariants.check_host_ids_match_job_start(job)
     assert not result['ok']
-    assert 'h2' in result['detail'] and f'h3 [{h3_new.id}] != {h3_old}' in result['detail']
+    assert 'h2 [' not in result['detail'] and f'h3 [{h3_new.id}] != {h3_old}' in result['detail']
+
+
+@pytest.mark.django_db
+def test_host_ids_deleted_host_events_may_carry_the_job_start_id_or_none(job, hosts):
+    """The callback receiver nulls a deleted host's id: events before the delete keep the id."""
+    snap = _snapshot(hosts)
+    h1, h2, _ = hosts
+    _event(job, 1, host=h1)
+    _event(job, 2, host=h2)
+    h2.delete()
+    JobEvent.objects.create(job=job, counter=3, event='runner_on_ok', job_created=job.created, host_name='h2', host_id=None)
+    _set_host_map_snapshot(job, snap)
+    assert job_invariants.check_host_ids_match_job_start(job)['ok']
+
+    # A host that still exists must keep its job-start id.
+    JobEvent.objects.create(job=job, counter=4, event='runner_on_ok', job_created=job.created, host_name='h1', host_id=None)
+    result = job_invariants.check_host_ids_match_job_start(job)
+    assert not result['ok'] and f'h1 [{h1.id}, None] != {h1.id}' in result['detail']
 
 
 @pytest.mark.django_db
