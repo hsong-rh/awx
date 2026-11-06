@@ -21,7 +21,7 @@ from awx.main.utils.redis import get_redis_client
 from awx.main.utils.db import set_connection_name
 from awx.main.utils.failpoints import failpoint
 from awx.main.consumers import emit_channel_notification
-from awx.main.models import JobEvent, AdHocCommandEvent, ProjectUpdateEvent, InventoryUpdateEvent, SystemJobEvent, UnifiedJob
+from awx.main.models import Host, JobEvent, AdHocCommandEvent, ProjectUpdateEvent, InventoryUpdateEvent, SystemJobEvent, UnifiedJob
 from awx.main.constants import ACTIVE_STATES
 from awx.main.models.events import emit_event_detail
 from awx.main.utils.profiling import AWXProfiler
@@ -37,6 +37,23 @@ def _is_unique_constraint_violation(exc):
     if hasattr(cause, 'pgcode') and cause.pgcode == '23505':
         return True
     return 'UNIQUE constraint failed' in str(exc)
+
+
+def _null_missing_host_ids(events):
+    """Null host_id on events whose host no longer exists.
+
+    The event host FKs have no DB constraint (lost in the bigint migration), so a host deleted
+    mid-job leaves a dangling id. JobHostSummary already nulls these.
+    """
+    # Only real ids are checked: anything else ('' for an unmapped host) is left to the save, so
+    # one malformed id cannot make the whole batch fail here.
+    ids = {e.host_id for e in events if isinstance(getattr(e, 'host_id', None), int)}
+    if not ids:
+        return
+    live = set(Host.objects.filter(id__in=ids).values_list('id', flat=True))
+    for e in events:
+        if isinstance(getattr(e, 'host_id', None), int) and e.host_id not in live:
+            e.host_id = None
 
 
 def job_stats_wrapup(job_identifier, event=None):
@@ -234,6 +251,9 @@ class CallbackBrokerWorker:
                         metrics_events_missing_created += 1
                     else:  # only calculate the seconds if the created time already has been set
                         metrics_total_job_event_processing_seconds += e.modified - e.created
+                # Before the try below: a database error here raises out of flush() and perform_work
+                # retries it like any other, where the per-event fallback would skip the check.
+                _null_missing_host_ids(events)
                 metrics_duration_to_save = time.perf_counter()
                 saved_events = []
                 try:
