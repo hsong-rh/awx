@@ -506,7 +506,6 @@ class TestGenericRun:
         task = jobs.RunJob()
         task.runner_callback.instance = job
         task.runner_callback.safe_env = {'secret_key': 'redacted_value'}
-        task.runner_callback.host_map = {'myhost': 42}
         task.runner_callback.update_model = mock.Mock(wraps=update_model_wrapper)
         runner_config = MockMe()
         runner_config.command = {'foo': 'bar'}
@@ -518,8 +517,35 @@ class TestGenericRun:
             1,
             job_args=json.dumps({'foo': 'bar'}),
             job_cwd='/foobar',
-            job_env={'switch': 'blade', 'foot': 'ball', 'secret_key': 'redacted_value', 'host_map': {'myhost': 42}},
+            job_env={'switch': 'blade', 'foot': 'ball', 'secret_key': 'redacted_value'},
         )
+
+    @pytest.mark.parametrize(
+        'host_count, existing_job_env, stored',
+        [
+            (3, {}, {'host_count': 3}),
+            (None, {'host_count': 5}, {'host_count': 5}),  # an adopter replaying 'starting' keeps the original
+            (3, {'host_count': 5}, {'host_count': 3}),
+            (None, {}, {}),
+        ],
+    )
+    def test_save_job_metadata_stores_the_host_count(self, job, update_model_wrapper, mock_me, host_count, existing_job_env, stored):
+        class MockMe:
+            pass
+
+        task = jobs.RunJob()
+        job.job_env = existing_job_env
+        task.runner_callback.instance = job
+        task.runner_callback.host_count = host_count
+        task.runner_callback.update_model = mock.Mock(wraps=update_model_wrapper)
+        runner_config = MockMe()
+        runner_config.command = {}
+        runner_config.cwd = '/foobar'
+        runner_config.env = {}
+        task.runner_callback.status_handler({'status': 'starting'}, runner_config)
+
+        saved_env = task.runner_callback.update_model.call_args.kwargs['job_env']
+        assert {k: v for k, v in saved_env.items() if k == 'host_count'} == stored
 
     def test_created_by_extra_vars(self, mock_me):
         job = Job(created_by=User(pk=123, username='angry-spud'))

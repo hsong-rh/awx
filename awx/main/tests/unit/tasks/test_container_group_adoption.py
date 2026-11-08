@@ -13,6 +13,7 @@ from unittest.mock import DEFAULT, Mock, patch
 
 import pytest
 
+from awx.main.models import Job
 from awx.main.tasks.container_groups import (
     PodState,
     adopt_container_group_job,
@@ -719,6 +720,7 @@ def harvest_env(tmp_path):
     callback.status_handler = Mock(return_value=False)
     callback.artifacts_handler = Mock()
     callback.finished_callback = Mock()
+    callback.inventory_change = None
 
     # DEFAULT sentinels, not explicit Mocks: patch.multiple only hands back a dict of the
     # mocks it created itself, so passing values yields an empty dict and no way to assert.
@@ -845,3 +847,109 @@ def test_harvest_unpacks_artifacts_where_the_post_run_hooks_read_them(harvest_en
         harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
 
     assert run.call_args.kwargs['ident'] == 42
+
+
+# ---------------------------------------------------------------------------
+# A changed inventory: the job's host results cannot be trusted
+# ---------------------------------------------------------------------------
+
+CHANGED = 'hosts were added or removed'
+
+
+def _host_job(cancel_flag=False):
+    job = Mock(spec=Job)
+    job.id = job.pk = 42
+    job.log_format = 'job 42'
+    job.cancel_flag = cancel_flag
+    return job
+
+
+def test_harvest_fails_a_job_whose_inventory_changed(harvest_env):
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+    harvest_env['callback'].inventory_change = CHANGED
+
+    harvest_terminal_pod(_host_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
+
+    assert harvest_env['_finalize_adopted_job'].call_args.kwargs['final_status'] == 'failed'
+    assert harvest_env['invoke_adoption_hooks'].call_args.args[3] == 'failed'  # so the fact cache never runs
+    explanation = harvest_env['callback'].delay_update.call_args.kwargs['job_explanation']
+    assert 'could not be matched to the inventory' in explanation and CHANGED in explanation
+
+
+def test_harvest_still_replays_the_log_of_a_job_whose_inventory_changed(harvest_env):
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+    harvest_env['callback'].inventory_change = CHANGED
+
+    harvest_terminal_pod(_host_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
+
+    assert len(harvest_env['callback'].event_handler.call_args_list) == 3
+
+
+def test_harvest_leaves_a_job_canceled_while_orphaned_alone(harvest_env):
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+    harvest_env['callback'].inventory_change = CHANGED
+
+    harvest_terminal_pod(_host_job(cancel_flag=True), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
+
+    assert harvest_env['_finalize_adopted_job'].call_args.kwargs['final_status'] == 'successful'
+    harvest_env['callback'].delay_update.assert_not_called()
+
+
+def test_harvest_deletes_a_running_pod_only_after_its_log_was_read(harvest_env):
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+    harvest_env['callback'].inventory_change = CHANGED
+    replayed_when_deleted = []
+
+    with patch('awx.main.tasks.container_groups.delete_job_pod') as delete:
+        delete.side_effect = lambda *a: replayed_when_deleted.append(len(harvest_env['callback'].event_handler.call_args_list))
+        harvest_terminal_pod(_host_job(), 'automation-job-42-abcde', _pod(phase='Running'), stop_pod=True)
+
+    assert replayed_when_deleted == [3]
+    assert harvest_env['_finalize_adopted_job'].call_args.kwargs['final_status'] == 'failed'
+
+
+def test_a_stopped_pod_fails_the_job_even_if_the_recheck_comes_back_clean(harvest_env):
+    """The caller saw a change, but the callback's recheck did not (the change was undone)."""
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+    harvest_env['callback'].host_map = {'h1': 1}
+
+    with patch('awx.main.tasks.container_groups.delete_job_pod'):
+        harvest_terminal_pod(_host_job(), 'automation-job-42-abcde', _pod(phase='Running'), stop_pod=True)
+
+    assert harvest_env['_finalize_adopted_job'].call_args.kwargs['final_status'] == 'failed'
+    assert 'the inventory changed before the pod was stopped' in harvest_env['callback'].delay_update.call_args.kwargs['job_explanation']
+    assert harvest_env['callback'].host_map == {}
+
+
+def test_harvest_keeps_a_pod_it_was_not_asked_to_stop(harvest_env):
+    harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
+
+    with patch('awx.main.tasks.container_groups.delete_job_pod') as delete:
+        harvest_terminal_pod(_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
+
+    delete.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    'changed, cancel_flag, harvested',
+    [(CHANGED, False, True), (None, False, False), (CHANGED, True, False)],
+    ids=['changed-is-harvested-and-stopped', 'unchanged-is-attached', 'canceled-is-attached'],
+)
+def test_a_streaming_pod_of_a_changed_inventory_is_read_then_stopped(adoption_env, changed, cancel_flag, harvested):
+    """A cancel straight after attaching can drop output the new unit has not copied from the pod
+    yet, so a changed job's pod is read in full first. A canceled job goes the usual way."""
+    adoption_env['classify_job_pod'].return_value = PodState.STREAMING
+    adoption_env['attach_to_streaming_pod'].return_value = True
+    pod = _pod()
+    adoption_env['find_job_pod'].return_value = pod
+    job = _host_job(cancel_flag=cancel_flag)
+
+    with patch('awx.main.tasks.container_groups.inventory_change_since_start', return_value=changed):
+        assert adopt_container_group_job(job) is True
+
+    if harvested:
+        assert adoption_env['harvest_terminal_pod'].call_args.kwargs['stop_pod'] is True
+        adoption_env['attach_to_streaming_pod'].assert_not_called()
+    else:
+        adoption_env['harvest_terminal_pod'].assert_not_called()
+        adoption_env['attach_to_streaming_pod'].assert_called_once()

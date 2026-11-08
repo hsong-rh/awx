@@ -49,12 +49,17 @@ def env(settings, tmp_path):
 
 def running_job(controller, execution_node=EXEC, task_id='job-task', **fields):
     fields.setdefault('work_unit_id', UNIT)
+    started = now() - timedelta(seconds=60)
+    if fields.get('inventory'):
+        # The hosts exist by now, so the job started after them, with their count saved: as a normal run does.
+        started = now()
+        fields.setdefault('job_env', {'host_count': fields['inventory'].hosts.count()})
     return Job.objects.create(
         controller_node=controller,
         execution_node=execution_node,
         status='running',
         celery_task_id=task_id,
-        started=now() - timedelta(seconds=60),
+        started=started,
         **fields,
     )
 

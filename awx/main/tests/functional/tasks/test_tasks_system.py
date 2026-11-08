@@ -1282,40 +1282,14 @@ def test_populate_host_map_from_inventory_resolves_real_hosts(me_inst):
     org = Organization.objects.first()
     inv = Inventory.objects.create(name='cb-hostmap-inv', organization=org)
     host = Host.objects.create(name='myhost', inventory=inv)
-    job = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id='unit-hm', inventory=inv)
-
-    cb = RunnerCallback(model=Job)
-    cb.populate_host_map_from_inventory(job)
-
-    assert cb.host_map.get('myhost') == host.id
-
-
-@pytest.mark.django_db
-def test_populate_host_map_from_inventory_prefers_job_env_snapshot(me_inst):
-    """If job_env already carries a host_map snapshot from job start, adoption must use it
-
-    instead of re-querying the current inventory, so a host deleted or disabled while the
-    job was orphaned still replays with the id it had when the job started.
-    """
-    from awx.main.tasks.callback import RunnerCallback
-    from awx.main.models import Organization, Inventory, Host
-
-    org = Organization.objects.first()
-    inv = Inventory.objects.create(name='cb-hostmap-snapshot-inv', organization=org)
-    Host.objects.create(name='myhost', inventory=inv)
     job = Job.objects.create(
-        controller_node=me_inst.hostname,
-        status='running',
-        work_unit_id='unit-hm-snap',
-        inventory=inv,
-        job_env={'host_map': {'myhost': 999, 'deleted-host': 111}},
+        controller_node=me_inst.hostname, status='running', work_unit_id='unit-hm', inventory=inv, started=now(), job_env={'host_count': 1}
     )
 
     cb = RunnerCallback(model=Job)
     cb.populate_host_map_from_inventory(job)
 
-    # 999 is not host.id: proves the snapshot won, not a live requery.
-    assert cb.host_map == {'myhost': 999, 'deleted-host': 111}
+    assert cb.host_map.get('myhost') == host.id
 
 
 @pytest.mark.django_db

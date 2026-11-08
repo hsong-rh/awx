@@ -74,11 +74,59 @@ def try_load_query_file(artifact_dir) -> Tuple[bool, Optional[dict]]:
         return True, queries
 
 
+def carries_host_ids(instance):
+    """Only Job and AdHocCommand events carry host_id, so only they need the inventory to be unchanged."""
+    from awx.main.models import AdHocCommand, Job  # Circular import
+
+    return isinstance(instance, (Job, AdHocCommand))
+
+
+def needs_host_attribution(instance):
+    return carries_host_ids(instance) and bool(instance.inventory_id)
+
+
+def inventory_change_since_start(job):
+    """Why this job's host ids can no longer be taken from its inventory, or None if it is unchanged.
+
+    Any of these counts: no host count was saved at job start, the inventory is gone, a host was
+    added or removed (the count), a host was created or edited after the job started, or an
+    inventory update was created after it. The update check is what sees a sync's renames and
+    enabled toggles: the importer saves them with update_fields, which never moves Host.modified.
+    """
+    from awx.main.models import InventoryUpdate  # Circular import
+
+    saved = (job.job_env or {}).get('host_count')
+    inventory = job.inventory
+    if inventory is None:
+        # A job that never had an inventory has no hosts to attribute. One that had one is
+        # known by its saved count, and its inventory has been deleted since.
+        return None if saved is None else 'the inventory was deleted'
+    if saved is None:
+        return 'no host count was saved when the job started'
+    if job.started is None:
+        return 'the job has no start time'
+    if inventory.hosts.count() != saved:
+        return 'hosts were added or removed'
+    if inventory.hosts.filter(modified__gt=job.started).exists():
+        return 'a host was added or edited'
+    # A smart inventory has no sources: its hosts are every matching host of its organization.
+    updates = InventoryUpdate.objects.filter(created__gt=job.started)
+    if inventory.kind == 'smart':
+        updates = updates.filter(inventory_source__inventory__organization_id=inventory.organization_id)
+    else:
+        updates = updates.filter(inventory_source__inventory=inventory)
+    if updates.exists():
+        return 'the inventory was updated'
+    return None
+
+
 class RunnerCallback:
     def __init__(self, model=None):
         self.instance = None
         self.parent_workflow_job_id = None
         self.host_map = {}
+        self.host_count = None  # set only by a normal run, see record_host_count
+        self.inventory_change = None  # set only by adoption: why replayed events carry no host_id
         self.guid = get_guid()
         self.job_created = None
         self.recent_event_timings = deque(maxlen=settings.MAX_WEBSOCKET_EVENT_RATE)
@@ -179,24 +227,32 @@ class RunnerCallback:
         for hostname, hv in script_data.get('_meta', {}).get('hostvars', {}).items():
             self.host_map[hostname] = hv.get('remote_tower_id', '')
 
-    def populate_host_map_from_inventory(self, instance):
-        """Adoption path: prefer the host_map snapshotted at job start, since the inventory may
+    def record_host_count(self, instance):
+        """Count the inventory's hosts for status_handler to save. Call it before the inventory is
+        read: a host deleted in between then makes the count differ at adoption, not match it."""
+        if needs_host_attribution(instance):
+            self.host_count = instance.inventory.hosts.count()
 
-        have changed while the job was orphaned. Jobs started before this snapshot existed
-        (rolling upgrade) have no 'host_map' key in job_env, so fall back to fetching script_data
-        ourselves — this rebuilds the map from the inventory as it is *now*, which is only right
-        for a job whose inventory never changed during the outage.
+    def populate_host_map_from_inventory(self, instance):
+        """Adoption path: rebuild the host map from the inventory, but only if it is unchanged since
+        the job started. Otherwise the map stays empty (replayed events get host_id=None) and the
+        reason is returned. The check runs again after the read, so a change made while the map was
+        read invalidates it too. Job types whose events carry no host_id are not checked.
         """
-        snapshot = (instance.job_env or {}).get('host_map')
-        if snapshot:
-            self.host_map = dict(snapshot)
-            return
-        if not (hasattr(instance, 'inventory') and instance.inventory_id):
-            return
-        try:
-            self.populate_host_map(instance.inventory.get_script_data(**self.inventory_script_params(instance)))
-        except Exception:
-            logger.warning('Could not populate host map for job %s; host_id will be unset on replayed events', instance.id, exc_info=True)
+        if not carries_host_ids(instance):
+            return None
+        reason = inventory_change_since_start(instance)
+        if reason is None and instance.inventory_id:
+            try:
+                self.populate_host_map(instance.inventory.get_script_data(**self.inventory_script_params(instance)))
+            except Exception:
+                logger.warning('Could not populate host map for job %s; host_id will be unset on replayed events', instance.id, exc_info=True)
+                reason = 'the host map could not be read'
+            else:
+                reason = inventory_change_since_start(instance)
+        if reason:
+            self.host_map = {}
+        return reason
 
     def event_handler(self, event_data):
         #
@@ -359,9 +415,10 @@ class RunnerCallback:
             for k, v in self.safe_env.items():
                 if k in job_env:
                     job_env[k] = v
-            # Snapshot hostname -> id as of job start, so adoption can replay with these ids
-            # instead of rebuilding the map from whatever the inventory looks like by then.
-            job_env['host_map'] = self.host_map
+            # An adopter replaying 'starting' never counts: it keeps the count saved at job start.
+            host_count = self.host_count if self.host_count is not None else (self.instance.job_env or {}).get('host_count')
+            if host_count is not None:
+                job_env['host_count'] = host_count
             from awx.main.signals import disable_activity_stream  # Circular import
 
             with disable_activity_stream():

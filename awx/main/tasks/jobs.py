@@ -548,6 +548,7 @@ class BaseTask(object):
 
     def build_inventory(self, instance, private_data_dir):
         script_params = self.runner_callback.inventory_script_params(instance)
+        self.runner_callback.record_host_count(instance)
         return self.write_inventory_file(instance.inventory, private_data_dir, 'hosts', script_params)
 
     def build_args(self, instance, private_data_dir, passwords):

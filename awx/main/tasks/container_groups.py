@@ -35,6 +35,7 @@ from awx.main.models import UnifiedJob
 from awx.main.scheduler.kubernetes import PodManager
 from awx.main.tasks.adoption import invoke_adoption_hooks
 from awx.main.tasks.adoption_decisions import is_requeueable
+from awx.main.tasks.callback import carries_host_ids, inventory_change_since_start
 from awx.main.tasks.receptor import (
     ReceptorWork,
     AWXReceptorJob,
@@ -44,6 +45,7 @@ from awx.main.tasks.receptor import (
     _compute_adoption_dedup,
     _finalize_adopted_job,
     _get_or_create_private_data_dir,
+    failed_by_inventory_change,
     get_receptor_ctl,
     read_receptor_config,
     reattach_to_work_unit,
@@ -279,7 +281,7 @@ def requeue_wedged_job(job, reason='pod never received its private data dir'):
     return bool(updated)
 
 
-def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None, clock=None):
+def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None, clock=None, stop_pod=False):
     """Recover a finished container-group job from its pod's log.
 
     The pod's stdout is the work unit's stdout, so this feeds the same ansible-runner process
@@ -287,6 +289,10 @@ def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None, clock=None):
     database are skipped, so replaying the log from the beginning is safe.
 
     owner_task_id is the adoption's claim; the final status is written only while it still holds.
+
+    stop_pod is for a pod that is still running but whose job can no longer be trusted (its
+    inventory changed): the log is read in full first, then the pod is deleted, and the job ends
+    failed. Deleting first would delete the log the events are replayed from.
 
     Returns True if the job reached a terminal status, or another task now owns it; False if
     it should be retried later.
@@ -298,6 +304,11 @@ def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None, clock=None):
     )
 
     callback = _build_adoption_callback(job, safe_threshold, collision_zone)
+    if stop_pod and not callback.inventory_change:
+        # The caller saw a change; a recheck can come back clean (a host added, then deleted).
+        # The pod is stopped either way, so its partial log must not decide the status.
+        callback.inventory_change = 'the inventory changed before the pod was stopped'
+        callback.host_map = {}
     # Account for events already persisted so emitted_events and the EOF final_counter
     # describe the whole job rather than just this replay.
     callback.event_ct = persisted_ct
@@ -312,7 +323,9 @@ def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None, clock=None):
             logger.exception(f'{job.log_format}: failed reading the log of terminal pod {pod_name}, deferring')
             return False
 
-        status, exit_code = _terminal_status(job, pod, res)
+        if stop_pod:
+            delete_job_pod(job, pod_name)
+        status, exit_code = failed_by_inventory_change(job, callback) or _terminal_status(job, pod, res)
 
         hook_succeeded, hook_error = invoke_adoption_hooks(job, callback, private_data_dir, status)
         if not hook_succeeded:
@@ -493,6 +506,10 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None, clock=
         return True
 
     if state == PodState.STREAMING:
+        if carries_host_ids(job) and not job.cancel_flag and inventory_change_since_start(job):
+            # Cancelling right after attaching can drop output the new unit has not copied from
+            # the pod yet, so read the pod's log in full, then stop it. A canceled job goes the usual way.
+            return harvest_terminal_pod(job, pod_name, pod, owner_task_id=owner_task_id, clock=clock, stop_pod=True)
         return attach_to_streaming_pod(job, pod_name, pod, receptor_ctl=receptor_ctl, owner_task_id=owner_task_id, clock=clock)
 
     # WAITING defers. The pod is silent and still inside the wedge budget, so a slow start and

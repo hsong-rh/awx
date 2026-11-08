@@ -22,6 +22,7 @@ import pytest
 from django.test import override_settings
 from django.utils.timezone import now
 
+from awx.main.models import Job
 from awx.main.tasks.callback import RunnerCallback
 from awx.main.tasks.jobs import _finalize_job_run
 from awx.main.tasks.receptor import (
@@ -1513,12 +1514,19 @@ def test_finalize_job_run_logs_lifecycle(mock_update, mock_hook, mock_task_mgr, 
 # ---------------------------------------------------------------------------
 
 
-def test_populate_host_map_from_inventory_populates_host_map():
-    """The adoption path sources host_map by fetching script_data itself when job_env has no snapshot."""
-    cb = RunnerCallback(model=None)
-    instance = Mock()
+def _job_instance(**attrs):
+    instance = Mock(spec=Job)
     instance.job_env = {}
     instance.inventory_id = 42
+    for name, value in attrs.items():
+        setattr(instance, name, value)
+    return instance
+
+
+def test_populate_host_map_from_inventory_populates_host_map():
+    """The adoption path sources host_map by fetching script_data itself, once the inventory is known to be unchanged."""
+    cb = RunnerCallback(model=None)
+    instance = _job_instance()
     instance.inventory.get_script_data.return_value = {
         '_meta': {
             'hostvars': {
@@ -1528,7 +1536,8 @@ def test_populate_host_map_from_inventory_populates_host_map():
         }
     }
 
-    cb.populate_host_map_from_inventory(instance)
+    with patch('awx.main.tasks.callback.inventory_change_since_start', return_value=None):
+        assert cb.populate_host_map_from_inventory(instance) is None
 
     assert cb.host_map == {'host1': 'ext-1', 'host2': 'ext-2'}
 
@@ -1536,24 +1545,21 @@ def test_populate_host_map_from_inventory_populates_host_map():
 def test_populate_host_map_from_inventory_swallows_error():
     """If fetching inventory hosts raises, the exception is swallowed and host_map stays {}."""
     cb = RunnerCallback(model=None)
-    instance = Mock()
-    instance.job_env = {}
-    instance.inventory_id = 1
+    instance = _job_instance()
     instance.inventory.get_script_data.side_effect = Exception('DB error')
 
-    cb.populate_host_map_from_inventory(instance)  # must not raise
+    with patch('awx.main.tasks.callback.inventory_change_since_start', return_value=None):
+        cb.populate_host_map_from_inventory(instance)  # must not raise
 
     assert cb.host_map == {}
 
 
-def test_populate_host_map_from_inventory_skips_job_without_inventory():
-    """No inventory means no query — an inventory-less job must not hit get_script_data."""
+def test_populate_host_map_from_inventory_fails_closed_without_a_saved_count():
+    """A job with no host count saved at start is not trusted: no query, empty map, and a reason."""
     cb = RunnerCallback(model=None)
-    instance = Mock()
-    instance.job_env = {}
-    instance.inventory_id = None
+    instance = _job_instance()
 
-    cb.populate_host_map_from_inventory(instance)
+    assert 'no host count' in cb.populate_host_map_from_inventory(instance)
 
     assert cb.host_map == {}
     instance.inventory.get_script_data.assert_not_called()

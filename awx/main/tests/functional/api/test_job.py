@@ -17,20 +17,19 @@ from awx.main.models import JobTemplate, User, Job, AdHocCommand, ProjectUpdate,
 
 
 @pytest.mark.django_db
-def test_job_detail_hides_host_map_from_job_env(get, inventory, admin_user):
-    """job_env.host_map (AAP-96843) is an internal adoption snapshot, not an API-facing value.
+def test_job_detail_hides_the_adoption_keys_from_job_env(get, inventory, admin_user):
+    """job_env.host_count is internal to adoption, and so is the host_map an earlier build saved.
 
-    A large inventory makes the full map expensive to return on every GET, so the detail
-    API must strip it while the DB copy stays intact for adoption to read.
+    job_env is shown as the job's environment, so these would read as variables the playbook
+    ran with. The detail API strips them while the DB copy stays intact for adoption to read.
     """
-    job = Job.objects.create(inventory=inventory, status='successful', job_env={'ANSIBLE_FOO': 'bar', 'host_map': {'host1': 1, 'host2': 2}})
+    job = Job.objects.create(inventory=inventory, status='successful', job_env={'ANSIBLE_FOO': 'bar', 'host_count': 2, 'host_map': {'host1': 1, 'host2': 2}})
 
     r = get(job.get_absolute_url(), admin_user, expect=200)
 
-    assert 'host_map' not in r.data['job_env']
-    assert r.data['job_env']['ANSIBLE_FOO'] == 'bar'
+    assert r.data['job_env'] == {'ANSIBLE_FOO': 'bar'}
     job.refresh_from_db()
-    assert job.job_env['host_map'] == {'host1': 1, 'host2': 2}
+    assert job.job_env['host_count'] == 2
 
 
 @pytest.mark.django_db

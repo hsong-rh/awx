@@ -40,7 +40,7 @@ from awx.main.utils.common import (
     parse_yaml_or_json,
     cleanup_new_process,
 )
-from awx.main.constants import JOB_FOLDER_PREFIX, MAX_ISOLATED_PATH_COLON_DELIMITER
+from awx.main.constants import HOST_RESULTS_UNMATCHED, JOB_FOLDER_PREFIX, MAX_ISOLATED_PATH_COLON_DELIMITER
 from awx.main.tasks.signals import signal_state, signal_callback, SignalExit
 from awx.main.tasks.callback import RunnerCallback
 from awx.main.utils.update_model import NotOwner
@@ -1366,8 +1366,12 @@ def _build_adoption_callback(job, dedup_threshold, collision_zone):
         persisted_counters=collision_zone,
     )
     # Normal runs get host_map for free from build_inventory. Adoption writes no inventory
-    # file, so it has to source the same data itself or replayed events lose host_id.
-    callback.populate_host_map_from_inventory(job)
+    # file, so it has to source the same data itself or replayed events lose host_id. It does
+    # so only for an inventory that is unchanged since the job started; otherwise the map is
+    # empty and inventory_change says why.
+    callback.inventory_change = callback.populate_host_map_from_inventory(job)
+    if callback.inventory_change:
+        logger.warning('Job %s will not get host ids on replayed events: %s', job.id, callback.inventory_change)
     return callback
 
 
@@ -1683,6 +1687,19 @@ def _determine_adoption_status_from_unit(job, work, unit_id):
     return status, exit_code, True
 
 
+def failed_by_inventory_change(job, callback):
+    """('failed', 1), with the reason recorded, if a changed inventory fails this adopted job; else None.
+
+    The replayed events carry no host ids, so the job's host results cannot be trusted. A job
+    canceled while it was orphaned stays canceled. Called before the post-run hooks, which only
+    run for 'successful', so the fact cache never writes facts to a host that may now be another.
+    """
+    if not callback.inventory_change or job.cancel_flag:
+        return None
+    callback.delay_update(job_explanation=f'{HOST_RESULTS_UNMATCHED} ({callback.inventory_change}).')
+    return 'failed', 1
+
+
 def _finalize_adoption_result(job, callback, res, process_phase_failed, work, unit_id, private_data_dir, pod_name=None, clock=None, owner_task_id=None):
     """Finalize a job after adoption completes or fails.
 
@@ -1707,6 +1724,8 @@ def _finalize_adoption_result(job, callback, res, process_phase_failed, work, un
         status, exit_code, should_finalize = _determine_adoption_status_from_unit(job, work, unit_id)
         if not should_finalize:
             return False
+
+    status, exit_code = failed_by_inventory_change(job, callback) or (status, exit_code)
 
     # Call post-run hooks before finalization
     hook_succeeded, hook_error = invoke_adoption_hooks(job, callback, private_data_dir, status)
@@ -1797,6 +1816,17 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
     # Account for events already persisted so emitted_events / EOF final_counter reflect the
     # full job. Uses the DB count rather than len(collision_zone), which is capped.
     callback.event_ct = persisted_ct
+
+    # The job's host results can no longer be trusted, so stop the unit rather than let it run on:
+    # the stream below still carries what it already produced, as for a cancel. A pod attached
+    # to by a new unit is left to finish instead, because a cancel straight after the attach can
+    # drop output the unit has not copied from the pod yet. Either way the job ends failed.
+    if callback.inventory_change and not job.cancel_flag and not pod_name:
+        logger.info(f'Job {job.id}: stopping work unit {unit_id}, its host results cannot be matched to the inventory')
+        try:
+            work.cancel(unit_id)
+        except Exception as exc:
+            logger.warning(f'Could not cancel work unit {unit_id} for job {job.id}: {exc}')
 
     private_data_dir = _get_or_create_private_data_dir(job)
     adoption_task = _AdoptionTask(job, callback)
