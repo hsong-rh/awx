@@ -3,6 +3,7 @@ from unittest import mock
 
 import pytest
 
+from awx.main.constants import HOST_RESULTS_UNMATCHED
 from awx.main.models import HostMetric, Inventory, Job, JobEvent, JobHostSummary
 from awx.main.utils import job_invariants
 
@@ -33,10 +34,25 @@ def _snapshot(hosts):
     return {h.name: h.id for h in hosts}
 
 
+_HOST_MAPS = {}
+
+
+@pytest.fixture(autouse=True)
+def host_map_snapshots():
+    """The harness records the job-start host map (failpoints.record_snapshot); serve it from a dict."""
+    _HOST_MAPS.clear()
+    with mock.patch.object(job_invariants, 'get_snapshot', side_effect=lambda kind, key: _HOST_MAPS.get((kind, str(key)))):
+        yield
+
+
 def _set_host_map_snapshot(job, snap):
-    """Simulate RunnerCallback.status_handler persisting the job-start host_map (AAP-96843)."""
-    job.job_env = {'host_map': snap}
-    job.save(update_fields=['job_env'])
+    _HOST_MAPS[('host_map', str(job.id))] = snap
+
+
+def _fail_closed(job):
+    job.status = 'failed'
+    job.job_explanation = f'{HOST_RESULTS_UNMATCHED} (hosts were added or removed).'
+    job.save(update_fields=['status', 'job_explanation'])
 
 
 @pytest.mark.django_db
@@ -88,6 +104,54 @@ def test_host_ids_deleted_host_events_may_carry_the_job_start_id_or_none(job, ho
 
 
 @pytest.mark.django_db
+def test_host_ids_of_a_job_that_failed_closed_may_be_the_start_id_or_none_for_every_host(job, hosts):
+    """Adoption saw a changed inventory: events before the controller was lost keep their ids,
+    the replay carries none, and that holds for hosts that still exist."""
+    h1, h2, _ = hosts
+    _set_host_map_snapshot(job, _snapshot(hosts))
+    _event(job, 1, host=h1)
+    JobEvent.objects.create(job=job, counter=2, event='runner_on_ok', job_created=job.created, host_name='h1', host_id=None)
+    assert not job_invariants.check_host_ids_match_job_start(job)['ok']  # not failed closed: strict
+
+    _fail_closed(job)
+    assert job_invariants.check_host_ids_match_job_start(job)['ok']
+
+
+@pytest.mark.django_db
+def test_a_job_that_failed_closed_still_may_not_carry_another_hosts_id(job, hosts, inventory):
+    h1, h2, h3 = hosts
+    _set_host_map_snapshot(job, _snapshot(hosts))
+    _fail_closed(job)
+    _event(job, 1, host=h3)
+    JobEvent.objects.filter(job=job).update(host_name='h1')  # h1's events carrying h3's id
+    result = job_invariants.check_host_ids_match_job_start(job)
+    assert not result['ok'] and f'h1 [{h3.id}] != {h1.id}' in result['detail']
+
+
+@pytest.mark.django_db
+def test_summaries_of_a_job_that_failed_closed_may_carry_no_host(job, hosts):
+    h1, h2, _ = hosts
+    _set_host_map_snapshot(job, _snapshot(hosts))
+    JobHostSummary.objects.create(job=job, host=h1, host_name='h1')
+    JobHostSummary.objects.create(job=job, host=None, host_name='h2')
+    assert not job_invariants.check_host_ids_match_job_start(job)['ok']
+
+    _fail_closed(job)
+    assert job_invariants.check_host_ids_match_job_start(job)['ok']
+
+
+@pytest.mark.django_db
+def test_a_failed_job_with_another_explanation_is_checked_strictly(job, hosts):
+    h1, _, _ = hosts
+    _set_host_map_snapshot(job, _snapshot(hosts))
+    JobEvent.objects.create(job=job, counter=1, event='runner_on_ok', job_created=job.created, host_name='h1', host_id=None)
+    job.status = 'failed'
+    job.job_explanation = 'Job terminated due to timeout'
+    job.save(update_fields=['status', 'job_explanation'])
+    assert not job_invariants.check_host_ids_match_job_start(job)['ok']
+
+
+@pytest.mark.django_db
 def test_host_summaries_expect_none_for_deleted_hosts(job, hosts, inventory):
     snap = _snapshot(hosts)
     h1, h2, _ = hosts
@@ -106,9 +170,7 @@ def test_host_summaries_expect_none_for_deleted_hosts(job, hosts, inventory):
 
 @pytest.mark.django_db
 def test_host_ids_without_snapshot_checks_consistency(job, hosts, inventory):
-    """job.job_env has no 'host_map' key: a job that predates AAP-96843, or started before
-
-    status_handler's 'starting' branch ever ran."""
+    """The harness recorded no job-start host map for this job."""
     h1 = hosts[0]
     _event(job, 1, host=h1)
     result = job_invariants.check_host_ids_match_job_start(job)
@@ -300,3 +362,32 @@ def test_host_ids_constructed_inventory_summaries(organization, inventory, hosts
     assert not result['ok']
     assert f'h2 constructed_host_id {hosts[1].id} != {chosts[1].id}' in result['detail']
     assert f'h2 host_id None != {hosts[1].id}' in result['detail']
+
+
+@pytest.mark.django_db
+def test_constructed_summaries_of_a_job_that_failed_closed_may_carry_no_host(organization, inventory, hosts):
+    ci = Inventory.objects.create(name='constructed', organization=organization, kind='constructed')
+    chosts = [ci.hosts.create(name=h.name, instance_id=str(h.id)) for h in hosts]
+    job = Job.objects.create(inventory=ci, status='successful')
+    _set_host_map_snapshot(job, {h.name: h.id for h in chosts})
+    JobHostSummary.objects.create(job=job, host=hosts[0], constructed_host=chosts[0], host_name='h1')
+    JobHostSummary.objects.create(job=job, host=None, constructed_host=None, host_name='h2')
+    assert not job_invariants.check_host_ids_match_job_start(job)['ok']
+
+    _fail_closed(job)
+    assert job_invariants.check_host_ids_match_job_start(job)['ok']
+
+
+@pytest.mark.django_db
+def test_playbook_events_complete_a_job_adoption_stopped_may_have_no_final_event(job):
+    """Adoption cancels the unit of a job whose inventory changed, so the playbook never gets to its stats event."""
+    for i in range(1, 6):
+        _event(job, i)
+    assert not job_invariants.check_playbook_events_complete(job)['ok']  # a successful job must have one
+
+    _fail_closed(job)
+    assert job_invariants.check_playbook_events_complete(job)['ok']
+
+    job.job_explanation = 'Job terminated due to timeout'
+    job.save(update_fields=['job_explanation'])
+    assert not job_invariants.check_playbook_events_complete(job)['ok']  # any other failure still needs one

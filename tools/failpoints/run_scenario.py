@@ -1605,6 +1605,24 @@ def container_for_host(container):
 
 HOSTMAP_INV = 'failpoint hosts'
 HOSTMAP_HOSTS = [f'fp-h{i}' for i in range(1, 6)]
+# Keep in step with awx.main.constants.HOST_RESULTS_UNMATCHED: this script runs outside awx.
+HOSTMAP_UNMATCHED = 'host results could not be matched to the inventory'
+
+
+def hostmap_outcome(variant, adopt_via, status, explanation):
+    """What adoption must do: fail a job whose inventory changed while it was orphaned, adopt any other as before.
+
+    With --adopt-via none there is no failover, so no adoption and nothing to fail.
+    """
+    fails = variant == 'changed' and adopt_via != 'none'
+    explained = HOSTMAP_UNMATCHED in (explanation or '')
+    ok = (status == 'failed' and explained) if fails else (status == 'successful' and not explained)
+    want = 'failed with the unmatched-host explanation' if fails else 'successful, no unmatched-host explanation'
+    return {
+        'name': 'host_map_outcome',
+        'ok': ok,
+        'detail': f'inventory {variant}, adopt-via {adopt_via}: want {want}; got status={status}, explanation={explanation!r}',
+    }
 
 
 def hostmap_inventory(container):
@@ -1665,14 +1683,18 @@ emit(dict(original={original!r}, threshold=thr, events_by_host=rows, events_abov
 
 
 def scenario_host_map(containers, args):
-    """Host map: inventory changes while a job is orphaned; adoption rebuilds host_map from the current inventory.
+    """Host map: an inventory change while a job is orphaned fails the job; no change adopts it as before.
 
-    1. A 5-host inventory (ansible_connection=local); chatty.yml over all five.
-    2. --adopt-via restart: docker kill the controller, mutate the inventory while it is down,
-       start it again (same-node adoption). --adopt-via peer (PR): kill and leave it down;
-       mutate before the peer claims (cross-node). --adopt-via none: mutate mid-job with no
-       failover (the normal path's baseline).
-    3. Compare JobEvent.host_id and JobHostSummary.host_id with the ids the job started with.
+    1. A 5-host inventory (ansible_connection=local); chatty.yml over all five. The ids the job
+       starts with are recorded as the host_map snapshot the invariants compare against.
+    2. --adopt-via restart: docker kill the controller, change the inventory while it is down
+       (--variant changed, the default; --variant unchanged leaves it alone), start it again
+       (same-node adoption). --adopt-via peer (PR): kill and leave it down; change it before the
+       peer claims (cross-node). --adopt-via none: change it mid-job with no failover (the
+       normal path's baseline).
+    3. Expect the job failed with the unmatched-host explanation after a change, successful
+       otherwise, and JobEvent.host_id / JobHostSummary.host_id matching the ids it started with
+       (a failed job may carry no id).
     """
     c0 = containers[0]
     pr = is_pr_branch(c0)
@@ -1683,19 +1705,24 @@ def scenario_host_map(containers, args):
     owner, unit = st['controller_node'], st['work_unit_id']
     oc = container_for(owner)
     peer = next(c for c in containers if c != oc)
-    notes = [f"branch={'PR' if pr else 'devel'} adopt_via={args.adopt_via}; original host ids {original}"]
+    notes = [f"branch={'PR' if pr else 'devel'} adopt_via={args.adopt_via} variant={args.variant}; original host ids {original}"]
+    changed = args.variant == 'changed'
+    # The ids the job started with, for check-job's host_ids_match_job_start (first write wins).
+    orm(c0, f"from awx.main.utils import failpoints\nfailpoints.record_snapshot('host_map', {job_id}, {original!r})\nemit(True)")
     manage(peer, 'failpoint', 'arm', 'adoption.after_snapshot', '--action', 'sleep', '--seconds', '0', '--match', f'job_id={job_id}')
     time.sleep(args.lead)
     if args.adopt_via == 'none':
-        m = hostmap_mutate(peer)
-        log(f'mutated inventory mid-job (no failover): {m}')
-        notes.append(f"inventory mutated at {m['at']}: {m['hosts']}")
+        if changed:
+            m = hostmap_mutate(peer)
+            log(f'mutated inventory mid-job (no failover): {m}')
+            notes.append(f"inventory mutated at {m['at']}: {m['hosts']}")
     else:
         run(['docker', 'kill', oc])
         log(f'docker kill {oc}')
-        m = hostmap_mutate(peer)
-        log(f'mutated inventory while {owner} is down: {m}')
-        notes.append(f"inventory mutated at {m['at']}: {m['hosts']}")
+        if changed:
+            m = hostmap_mutate(peer)
+            log(f'mutated inventory while {owner} is down: {m}')
+            notes.append(f"inventory mutated at {m['at']}: {m['hosts']}")
         if args.adopt_via == 'restart':
             start_back(oc, owner)
         else:
@@ -1712,12 +1739,14 @@ def scenario_host_map(containers, args):
     print('\n=== Host map analysis ===')
     print(f"  original ids: {a['original']}; adoption safe_threshold={a['threshold']}")
     existing = set(a['existing'])
+    failed_closed = changed and args.adopt_via != 'none'
 
     def event_tag(r):
         # The callback receiver nulls the id of a host deleted before the batch is saved, so a
-        # deleted host's events may carry None as well as the original id.
+        # deleted host's events may carry None as well as the original id. A job that failed
+        # closed replays with no ids at all.
         orig_id = original.get(r['host_name'])
-        return 'original' if r['host_id'] == orig_id or (r['host_id'] is None and orig_id not in existing) else 'NOT ORIGINAL'
+        return 'original' if r['host_id'] == orig_id or (r['host_id'] is None and (orig_id not in existing or failed_closed)) else 'NOT ORIGINAL'
 
     print('  events by (host_name, host_id): ')
     for r in a['events_by_host']:
@@ -1731,10 +1760,14 @@ def scenario_host_map(containers, args):
         # A summary nulls host_id when that host has since been deleted (on_delete=SET_NULL,
         # jobs.py:1101), so None is the correct value there, not a drift from the original id.
         want = orig_id if orig_id in existing else None
-        tag = 'original' if r['host_id'] == want else 'NOT ORIGINAL'
+        tag = 'original' if r['host_id'] == want or (failed_closed and r['host_id'] is None) else 'NOT ORIGINAL'
         print(f"    {r['host_name']:<6} host_id={r['host_id']!s:<6} ok={r['ok']} failures={r['failures']} dark={r['dark']}  {tag}")
     notes.append(f'host map analysis: {json.dumps(a, default=str)}')
     result = report(containers, job_id, since, args, unit, notes)
+    outcome = hostmap_outcome(args.variant, args.adopt_via, result['status'], result['job_explanation'])
+    print(f"  [{'PASS' if outcome['ok'] else 'FAIL'}] {outcome['name']:<24} {outcome['detail']}")
+    result['checks'].append(outcome)
+    result['ok'] = result['ok'] and outcome['ok']
     if args.out:
         with open(os.path.join(args.out, f'{run_label(args)}-job{job_id}', 'hostmap.json'), 'w') as fh:
             json.dump(a, fh, indent=2, default=str)
@@ -7071,6 +7104,7 @@ PART5 = (
 )
 
 VARIANTS = {
+    'host-map': ('changed', 'unchanged'),
     'cancel-orphan': ('dead', 'restart', 'task-id-window', 'deferred'),
     'adopter-dies': ('third', 'return'),
     'claim-race': ('sweep-sweep', 'lost-sweep', 'lost-lost', 'lost-then-sweep'),

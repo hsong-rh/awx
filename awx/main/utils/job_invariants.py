@@ -9,7 +9,7 @@ the baseline a scenario is compared against.
 from django.db import connection
 from django.db.models import Max, OuterRef, Subquery
 
-from awx.main.constants import ACTIVE_STATES
+from awx.main.constants import ACTIVE_STATES, HOST_RESULTS_UNMATCHED
 from awx.main.models import Host, HostMetric, JobHostSummary, UnifiedJob
 from awx.main.utils.failpoints import get_snapshot
 
@@ -114,6 +114,11 @@ def check_host_summaries_unique(job):
     return {'name': 'host_summaries', 'ok': total == distinct, 'detail': f'{total} summaries for {distinct} hosts'}
 
 
+def _failed_closed(job):
+    """True if adoption failed this job because its host results could not be matched to the inventory."""
+    return job.status == 'failed' and HOST_RESULTS_UNMATCHED in (job.job_explanation or '')
+
+
 def _host_id(value):
     """host_map values are remote_tower_id from the inventory script: an int, or '' when unset."""
     try:
@@ -125,12 +130,8 @@ def _host_id(value):
 def check_host_ids_match_job_start(job):
     """Every event and host summary should carry the host ids the job started with.
 
-    A normal run builds its hostname-to-id map once, when it writes the inventory, and
-    RunnerCallback.status_handler persists a copy in job_env (AAP-96843). Adoption prefers
-    that snapshot; without it (job started before this fix, or job_env lost it some other
-    way) adoption rebuilds the map from the live inventory, so an inventory change during the
-    orphan window re-points replayed events and summaries. Expected, per host in the
-    job-start map:
+    The expected ids are a hostname-to-id map the harness recorded before it changed the
+    inventory (failpoints.record_snapshot('host_map', job.id, ...)). Expected, per host in it:
 
     - events: the job-start id if that host still exists, else the job-start id or None (the
       callback receiver nulls the id of a host deleted before a batch is saved, so a deleted
@@ -138,8 +139,11 @@ def check_host_ids_match_job_start(job):
     - summaries: the job-start id if that host still exists, else None (a normal run nulls
       ids of hosts deleted before the stats event, and the foreign key nulls them after).
 
-    Without a snapshot (job predates AAP-96843, or job_env lost it) it falls back to
-    consistency: one host id per host name across all events.
+    A job that adoption failed closed (its inventory changed while it had no controller) may
+    carry the job-start id or None for every host, existing or not: events before the controller
+    was lost keep their ids, and the replay carries none. Another host's id is still wrong.
+
+    Without a recorded map it falls back to consistency: one host id per host name across all events.
     """
     if not hasattr(job, 'job_host_summaries'):
         return {'name': 'host_ids_match_job_start', 'ok': True, 'detail': 'not applicable'}
@@ -148,22 +152,23 @@ def check_host_ids_match_job_start(job):
     for name, host_id in pairs:
         seen.setdefault(name, set()).add(host_id)
 
-    snapshot = (job.job_env or {}).get('host_map')
+    snapshot = get_snapshot('host_map', job.id)
     if snapshot is None:
         mixed = sorted(name for name, ids in seen.items() if len(ids) > 1)
         return {
             'name': 'host_ids_match_job_start',
             'ok': not mixed,
-            'detail': 'no job-start snapshot, checked consistency only: '
+            'detail': 'no job-start host map recorded, checked consistency only: '
             + (f'{len(mixed)} hosts with more than one host id across events: {", ".join(mixed[:10])}' if mixed else f'{len(seen)} hosts consistent'),
         }
 
+    failed_closed = _failed_closed(job)
     expected = {name: _host_id(value) for name, value in snapshot.items()}
     existing = set(Host.objects.filter(pk__in=[i for i in expected.values() if i is not None]).values_list('pk', flat=True))
     bad_events = sorted(
         f'{name} {sorted(ids, key=str)} != {expected[name]}'
         for name, ids in seen.items()
-        if name in expected and not ids <= ({expected[name]} if expected[name] in existing else {expected[name], None})
+        if name in expected and not ids <= ({expected[name]} if expected[name] in existing and not failed_closed else {expected[name], None})
     )
 
     bad_summaries = []
@@ -172,7 +177,7 @@ def check_host_ids_match_job_start(job):
             if name not in expected:
                 continue
             want = expected[name] if expected[name] in existing else None
-            if host_id != want:
+            if host_id != want and not (failed_closed and host_id is None):
                 bad_summaries.append(f'{name} {host_id} != {want}')
     elif job.inventory_id:
         # Constructed inventory: the job-start map holds the constructed hosts' ids. A summary
@@ -186,9 +191,9 @@ def check_host_ids_match_job_start(job):
             want_constructed = expected[name] if expected[name] in constructed else None
             original = constructed.get(expected[name])
             want_host = original if original in originals else None
-            if constructed_id != want_constructed:
+            if constructed_id != want_constructed and not (failed_closed and constructed_id is None):
                 bad_summaries.append(f'{name} constructed_host_id {constructed_id} != {want_constructed}')
-            if host_id != want_host:
+            if host_id != want_host and not (failed_closed and host_id is None):
                 bad_summaries.append(f'{name} host_id {host_id} != {want_host}')
     bad_summaries.sort()
 
@@ -338,8 +343,9 @@ def check_playbook_events_complete(job):
     (no gap, just a low maximum), and which emitted_events cannot see when it only counts
     what was replayed.
 
-    A job canceled or in error may legitimately stop before its final event; for those the
-    check only reports. A successful or failed job with no final event fails.
+    A job canceled or in error, or one adoption stopped because its inventory changed, may
+    legitimately stop before its final event; for those the check only reports. A successful
+    or failed job with no final event fails.
     """
     if not hasattr(job, 'job_host_summaries'):
         return {'name': 'playbook_events_complete', 'ok': True, 'detail': 'not applicable'}
@@ -347,7 +353,7 @@ def check_playbook_events_complete(job):
     stats = events.filter(event='playbook_on_stats').order_by('counter').first()
     distinct = events.order_by().values('counter').distinct().count()
     max_counter = events.aggregate(m=Max('counter'))['m'] or 0
-    may_stop_early = job.status in ('canceled', 'error') or job.cancel_flag
+    may_stop_early = job.status in ('canceled', 'error') or job.cancel_flag or _failed_closed(job)
     if stats is None:
         return {
             'name': 'playbook_events_complete',
