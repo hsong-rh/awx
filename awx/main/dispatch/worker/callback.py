@@ -34,7 +34,7 @@ logger = logging.getLogger('awx.main.commands.run_callback_receiver')
 def _is_unique_constraint_violation(exc):
     """Return True if exc is a unique-key IntegrityError (already stored, safe to skip)."""
     cause = getattr(exc, '__cause__', None)
-    if hasattr(cause, 'pgcode') and cause.pgcode == '23505':
+    if getattr(cause, 'sqlstate', None) == '23505':
         return True
     return 'UNIQUE constraint failed' in str(exc)
 
