@@ -548,7 +548,10 @@ class BaseTask(object):
         return self.write_private_data_file(private_data_dir, file_name, file_content, sub_dir='inventory', file_permissions=0o700)
 
     def build_inventory(self, instance, private_data_dir):
-        self.runner_callback.host_count = host_trust.count_hosts(instance)
+        host_count = self.runner_callback.host_count = host_trust.count_hosts(instance)
+        if host_count is not None:
+            # Saved now, not only at 'starting': a controller lost before that save still leaves the adopter a count.
+            self.instance = self.update_model(instance.pk, job_env={**(instance.job_env or {}), 'host_count': host_count})
         return self.write_inventory_file(instance.inventory, private_data_dir, 'hosts', host_trust.script_params(instance))
 
     def build_args(self, instance, private_data_dir, passwords):

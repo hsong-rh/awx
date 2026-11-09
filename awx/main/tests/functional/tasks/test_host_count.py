@@ -56,3 +56,24 @@ def test_build_inventory_counts_before_it_reads_the_hosts(inv, tmp_path):
         task.build_inventory(job, str(tmp_path))
     assert task.runner_callback.host_count == 3
     assert inv.hosts.count() == 2
+
+
+@pytest.mark.django_db
+def test_build_inventory_saves_the_count_before_the_job_is_submitted(inv, tmp_path):
+    """A controller lost before it saves 'starting' must still leave the adopter a count to compare."""
+    job = Job.objects.create(inventory=inv, job_env={'kept': '1'})
+    task = RunJob()
+    task.instance = job
+    task.build_inventory(job, str(tmp_path))
+    assert Job.objects.get(pk=job.pk).job_env == {'kept': '1', 'host_count': 3}
+    assert task.instance.job_env['host_count'] == 3
+
+
+@pytest.mark.django_db
+def test_build_inventory_saves_nothing_without_an_inventory(tmp_path):
+    job = Job.objects.create()
+    task = RunJob()
+    task.instance = job
+    with mock.patch.object(RunJob, 'write_inventory_file'):
+        task.build_inventory(job, str(tmp_path))
+    assert Job.objects.get(pk=job.pk).job_env == {}
