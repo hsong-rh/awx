@@ -14,6 +14,7 @@ from unittest.mock import DEFAULT, Mock, patch
 import pytest
 
 from awx.main.models import Job
+from awx.main.tasks import host_trust
 from awx.main.tasks.container_groups import (
     PodState,
     adopt_container_group_job,
@@ -720,7 +721,7 @@ def harvest_env(tmp_path):
     callback.status_handler = Mock(return_value=False)
     callback.artifacts_handler = Mock()
     callback.finished_callback = Mock()
-    callback.inventory_change = None
+    callback.host_verdict = host_trust.Verdict(None, {}, host_trust.PROCEED)
 
     # DEFAULT sentinels, not explicit Mocks: patch.multiple only hands back a dict of the
     # mocks it created itself, so passing values yields an empty dict and no way to assert.
@@ -854,6 +855,7 @@ def test_harvest_unpacks_artifacts_where_the_post_run_hooks_read_them(harvest_en
 # ---------------------------------------------------------------------------
 
 CHANGED = 'hosts were added or removed'
+CHANGED_VERDICT = host_trust.Verdict(CHANGED, {}, host_trust.STOP_AND_FAIL)
 
 
 def _host_job(cancel_flag=False):
@@ -866,7 +868,7 @@ def _host_job(cancel_flag=False):
 
 def test_harvest_fails_a_job_whose_inventory_changed(harvest_env):
     harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
-    harvest_env['callback'].inventory_change = CHANGED
+    harvest_env['callback'].host_verdict = CHANGED_VERDICT
 
     harvest_terminal_pod(_host_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
 
@@ -878,7 +880,7 @@ def test_harvest_fails_a_job_whose_inventory_changed(harvest_env):
 
 def test_harvest_still_replays_the_log_of_a_job_whose_inventory_changed(harvest_env):
     harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
-    harvest_env['callback'].inventory_change = CHANGED
+    harvest_env['callback'].host_verdict = CHANGED_VERDICT
 
     harvest_terminal_pod(_host_job(), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
 
@@ -887,7 +889,7 @@ def test_harvest_still_replays_the_log_of_a_job_whose_inventory_changed(harvest_
 
 def test_harvest_leaves_a_job_canceled_while_orphaned_alone(harvest_env):
     harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
-    harvest_env['callback'].inventory_change = CHANGED
+    harvest_env['callback'].host_verdict = CHANGED_VERDICT
 
     harvest_terminal_pod(_host_job(cancel_flag=True), 'automation-job-42-abcde', _pod(phase='Succeeded', exit_code=0))
 
@@ -897,7 +899,7 @@ def test_harvest_leaves_a_job_canceled_while_orphaned_alone(harvest_env):
 
 def test_harvest_deletes_a_running_pod_only_after_its_log_was_read(harvest_env):
     harvest_env['open_pod_log_stream'].return_value = io.BytesIO(POD_LOG)
-    harvest_env['callback'].inventory_change = CHANGED
+    harvest_env['callback'].host_verdict = CHANGED_VERDICT
     replayed_when_deleted = []
 
     with patch('awx.main.tasks.container_groups.delete_job_pod') as delete:
@@ -944,7 +946,7 @@ def test_a_streaming_pod_of_a_changed_inventory_is_read_then_stopped(adoption_en
     adoption_env['find_job_pod'].return_value = pod
     job = _host_job(cancel_flag=cancel_flag)
 
-    with patch('awx.main.tasks.container_groups.inventory_change_since_start', return_value=changed):
+    with patch('awx.main.tasks.host_trust.change_since_start', return_value=changed):
         assert adopt_container_group_job(job) is True
 
     if harvested:

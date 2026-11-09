@@ -13,6 +13,7 @@ from django.utils.timezone import now
 
 from awx.main.models import ActivityStream, InventorySource, InventoryUpdate, Job
 from awx.main.tasks.adoption import invoke_adoption_hooks
+from awx.main.tasks.receptor import reattach_to_work_unit
 from awx.main.tasks.system import adopt_job, awx_receptor_workunit_reaper
 from awx.main.tests.adoption_cluster import EXEC, PEER, UNIT, adoption_env, configure, make_cluster, mesh, run_lost_instance_handling
 from awx.main.tests.fake_receptor import FakeReceptorWork, FakeWorkUnit, RecordingDispatcher, make_events
@@ -154,6 +155,21 @@ def test_a_job_whose_inventory_changed_is_stopped_and_failed(me_inst, inventory)
     assert ('cancel', UNIT) in work.calls
     assert hooks.call_args.args[3] == 'failed'  # post-run hooks, and the fact cache with them, only run for 'successful'
     assert [event for event in RecordingDispatcher.dispatched if event.get('host_name')]
+
+
+@pytest.mark.django_db
+def test_a_pod_attached_by_a_new_unit_is_left_to_finish_and_the_job_failed(me_inst, inventory):
+    # A cancel straight after the attach can drop output the unit has not copied from the pod yet.
+    hosts, job = _orphaned_job_over_five_hosts(me_inst, inventory, None)
+    _change_the_inventory(inventory, hosts)
+    work = FakeReceptorWork({UNIT: FakeWorkUnit(host_events(list(hosts)))})
+
+    reattach_to_work_unit(job, work, pod_name='automation-job-1-abcde')
+
+    job.refresh_from_db()
+    assert job.status == 'failed'
+    assert 'hosts were added or removed' in job.job_explanation
+    assert ('cancel', UNIT) not in work.calls
 
 
 @pytest.mark.django_db

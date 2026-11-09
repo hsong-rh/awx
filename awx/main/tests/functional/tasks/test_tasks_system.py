@@ -1274,9 +1274,9 @@ def test_process_startup_jobs_skips_workflow_jobs(me_inst, settings):
 
 
 @pytest.mark.django_db
-def test_populate_host_map_from_inventory_resolves_real_hosts(me_inst):
+def test_the_adoption_host_map_resolves_real_hosts(me_inst):
     """Against a real inventory, the adoption path maps host name to the id events are stamped with."""
-    from awx.main.tasks.callback import RunnerCallback
+    from awx.main.tasks import host_trust
     from awx.main.models import Organization, Inventory, Host
 
     org = Organization.objects.first()
@@ -1286,10 +1286,7 @@ def test_populate_host_map_from_inventory_resolves_real_hosts(me_inst):
         controller_node=me_inst.hostname, status='running', work_unit_id='unit-hm', inventory=inv, started=now(), job_env={'host_count': 1}
     )
 
-    cb = RunnerCallback(model=Job)
-    cb.populate_host_map_from_inventory(job)
-
-    assert cb.host_map.get('myhost') == host.id
+    assert host_trust.assess(job).host_map.get('myhost') == host.id
 
 
 @pytest.mark.django_db

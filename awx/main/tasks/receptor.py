@@ -42,6 +42,7 @@ from awx.main.utils.common import (
 )
 from awx.main.constants import HOST_RESULTS_UNMATCHED, JOB_FOLDER_PREFIX, MAX_ISOLATED_PATH_COLON_DELIMITER
 from awx.main.tasks.signals import signal_state, signal_callback, SignalExit
+from awx.main.tasks import host_trust
 from awx.main.tasks.callback import RunnerCallback
 from awx.main.utils.update_model import NotOwner
 from awx.main.tasks.adoption import invoke_adoption_hooks
@@ -1357,8 +1358,11 @@ def _adoption_callback_class(job):
         return RunnerCallback
 
 
-def _build_adoption_callback(job, dedup_threshold, collision_zone):
-    """Construct the job type's RunnerCallback for event replay during adoption."""
+def _build_adoption_callback(job, dedup_threshold, collision_zone, attached_pod=False):
+    """Construct the job type's RunnerCallback for event replay during adoption.
+
+    attached_pod: a new work unit is attached to the job's running pod; see host_trust.assess.
+    """
     callback = _adoption_callback_class(job).create_for_job(
         job,
         safe_env=dict(job.job_env or {}),
@@ -1368,10 +1372,11 @@ def _build_adoption_callback(job, dedup_threshold, collision_zone):
     # Normal runs get host_map for free from build_inventory. Adoption writes no inventory
     # file, so it has to source the same data itself or replayed events lose host_id. It does
     # so only for an inventory that is unchanged since the job started; otherwise the map is
-    # empty and inventory_change says why.
-    callback.inventory_change = callback.populate_host_map_from_inventory(job)
-    if callback.inventory_change:
-        logger.warning('Job %s will not get host ids on replayed events: %s', job.id, callback.inventory_change)
+    # empty and host_verdict says why.
+    callback.host_verdict = host_trust.assess(job, attached_pod=attached_pod)
+    callback.host_map = callback.host_verdict.host_map
+    if callback.host_verdict.reason:
+        logger.warning('Job %s will not get host ids on replayed events: %s', job.id, callback.host_verdict.reason)
     return callback
 
 
@@ -1694,9 +1699,11 @@ def failed_by_inventory_change(job, callback):
     canceled while it was orphaned stays canceled. Called before the post-run hooks, which only
     run for 'successful', so the fact cache never writes facts to a host that may now be another.
     """
-    if not callback.inventory_change or job.cancel_flag:
+    verdict = callback.host_verdict
+    # cancel_flag again: a cancel that came after the verdict also wins.
+    if verdict is None or verdict.action == host_trust.PROCEED or job.cancel_flag:
         return None
-    callback.delay_update(job_explanation=f'{HOST_RESULTS_UNMATCHED} ({callback.inventory_change}).')
+    callback.delay_update(job_explanation=f'{HOST_RESULTS_UNMATCHED} ({verdict.reason}).')
     return 'failed', 1
 
 
@@ -1812,7 +1819,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
         f'(max counter={max_counter}), replaying from startpos=0 with counter-skip'
     )
 
-    callback = _build_adoption_callback(job, safe_threshold, collision_zone)
+    callback = _build_adoption_callback(job, safe_threshold, collision_zone, attached_pod=bool(pod_name))
     # Account for events already persisted so emitted_events / EOF final_counter reflect the
     # full job. Uses the DB count rather than len(collision_zone), which is capped.
     callback.event_ct = persisted_ct
@@ -1821,7 +1828,7 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
     # the stream below still carries what it already produced, as for a cancel. A pod attached
     # to by a new unit is left to finish instead, because a cancel straight after the attach can
     # drop output the unit has not copied from the pod yet. Either way the job ends failed.
-    if callback.inventory_change and not job.cancel_flag and not pod_name:
+    if callback.host_verdict.action == host_trust.STOP_AND_FAIL:
         logger.info(f'Job {job.id}: stopping work unit {unit_id}, its host results cannot be matched to the inventory')
         try:
             work.cancel(unit_id)

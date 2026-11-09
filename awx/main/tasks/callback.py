@@ -74,59 +74,13 @@ def try_load_query_file(artifact_dir) -> Tuple[bool, Optional[dict]]:
         return True, queries
 
 
-def carries_host_ids(instance):
-    """Only Job and AdHocCommand events carry host_id, so only they need the inventory to be unchanged."""
-    from awx.main.models import AdHocCommand, Job  # Circular import
-
-    return isinstance(instance, (Job, AdHocCommand))
-
-
-def needs_host_attribution(instance):
-    return carries_host_ids(instance) and bool(instance.inventory_id)
-
-
-def inventory_change_since_start(job):
-    """Why this job's host ids can no longer be taken from its inventory, or None if it is unchanged.
-
-    Any of these counts: no host count was saved at job start, the inventory is gone, a host was
-    added or removed (the count), a host was created or edited after the job started, or an
-    inventory update was created after it. The update check is what sees a sync's renames and
-    enabled toggles: the importer saves them with update_fields, which never moves Host.modified.
-    """
-    from awx.main.models import InventoryUpdate  # Circular import
-
-    saved = (job.job_env or {}).get('host_count')
-    inventory = job.inventory
-    if inventory is None:
-        # A job that never had an inventory has no hosts to attribute. One that had one is
-        # known by its saved count, and its inventory has been deleted since.
-        return None if saved is None else 'the inventory was deleted'
-    if saved is None:
-        return 'no host count was saved when the job started'
-    if job.started is None:
-        return 'the job has no start time'
-    if inventory.hosts.count() != saved:
-        return 'hosts were added or removed'
-    if inventory.hosts.filter(modified__gt=job.started).exists():
-        return 'a host was added or edited'
-    # A smart inventory has no sources: its hosts are every matching host of its organization.
-    updates = InventoryUpdate.objects.filter(created__gt=job.started)
-    if inventory.kind == 'smart':
-        updates = updates.filter(inventory_source__inventory__organization_id=inventory.organization_id)
-    else:
-        updates = updates.filter(inventory_source__inventory=inventory)
-    if updates.exists():
-        return 'the inventory was updated'
-    return None
-
-
 class RunnerCallback:
     def __init__(self, model=None):
         self.instance = None
         self.parent_workflow_job_id = None
         self.host_map = {}
-        self.host_count = None  # set only by a normal run, see record_host_count
-        self.inventory_change = None  # set only by adoption: why replayed events carry no host_id
+        self.host_count = None  # set only by a normal run, see host_trust.count_hosts
+        self.host_verdict = None  # set only by adoption: the host_trust.Verdict for replayed events
         self.guid = get_guid()
         self.job_created = None
         self.recent_event_timings = deque(maxlen=settings.MAX_WEBSOCKET_EVENT_RATE)
@@ -182,7 +136,7 @@ class RunnerCallback:
         normal test suite rather than only by adoption-specific tests.
 
         host_map is deliberately not set here — each path has a different cheapest source
-        for it. See populate_host_map.
+        for it. See host_trust.host_map_from.
 
         Args:
             instance: the UnifiedJob model instance being run
@@ -212,47 +166,6 @@ class RunnerCallback:
         callback = cls(model=type(instance))
         callback.configure_for_job(instance, safe_env, dedup_threshold, persisted_counters)
         return callback
-
-    @staticmethod
-    def inventory_script_params(instance):
-        """Arguments for Inventory.get_script_data, matching what build_inventory writes."""
-        script_params = {"hostvars": True, "towervars": True}
-        if hasattr(instance, 'job_slice_number'):
-            script_params['slice_number'] = instance.job_slice_number
-            script_params['slice_count'] = instance.job_slice_count
-        return script_params
-
-    def populate_host_map(self, script_data):
-        """Map hostname -> remote_tower_id so event_handler can stamp host_id on events."""
-        for hostname, hv in script_data.get('_meta', {}).get('hostvars', {}).items():
-            self.host_map[hostname] = hv.get('remote_tower_id', '')
-
-    def record_host_count(self, instance):
-        """Count the inventory's hosts for status_handler to save. Call it before the inventory is
-        read: a host deleted in between then makes the count differ at adoption, not match it."""
-        if needs_host_attribution(instance):
-            self.host_count = instance.inventory.hosts.count()
-
-    def populate_host_map_from_inventory(self, instance):
-        """Adoption path: rebuild the host map from the inventory, but only if it is unchanged since
-        the job started. Otherwise the map stays empty (replayed events get host_id=None) and the
-        reason is returned. The check runs again after the read, so a change made while the map was
-        read invalidates it too. Job types whose events carry no host_id are not checked.
-        """
-        if not carries_host_ids(instance):
-            return None
-        reason = inventory_change_since_start(instance)
-        if reason is None and instance.inventory_id:
-            try:
-                self.populate_host_map(instance.inventory.get_script_data(**self.inventory_script_params(instance)))
-            except Exception:
-                logger.warning('Could not populate host map for job %s; host_id will be unset on replayed events', instance.id, exc_info=True)
-                reason = 'the host map could not be read'
-            else:
-                reason = inventory_change_since_start(instance)
-        if reason:
-            self.host_map = {}
-        return reason
 
     def event_handler(self, event_data):
         #

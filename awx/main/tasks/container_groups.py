@@ -35,7 +35,7 @@ from awx.main.models import UnifiedJob
 from awx.main.scheduler.kubernetes import PodManager
 from awx.main.tasks.adoption import invoke_adoption_hooks
 from awx.main.tasks.adoption_decisions import is_requeueable
-from awx.main.tasks.callback import carries_host_ids, inventory_change_since_start
+from awx.main.tasks import host_trust
 from awx.main.tasks.receptor import (
     ReceptorWork,
     AWXReceptorJob,
@@ -304,10 +304,10 @@ def harvest_terminal_pod(job, pod_name, pod, owner_task_id=None, clock=None, sto
     )
 
     callback = _build_adoption_callback(job, safe_threshold, collision_zone)
-    if stop_pod and not callback.inventory_change:
+    if stop_pod and not callback.host_verdict.reason:
         # The caller saw a change; a recheck can come back clean (a host added, then deleted).
         # The pod is stopped either way, so its partial log must not decide the status.
-        callback.inventory_change = 'the inventory changed before the pod was stopped'
+        callback.host_verdict = host_trust.Verdict('the inventory changed before the pod was stopped', {}, host_trust.STOP_AND_FAIL)
         callback.host_map = {}
     # Account for events already persisted so emitted_events and the EOF final_counter
     # describe the whole job rather than just this replay.
@@ -506,7 +506,7 @@ def adopt_container_group_job(job, receptor_ctl=None, owner_task_id=None, clock=
         return True
 
     if state == PodState.STREAMING:
-        if carries_host_ids(job) and not job.cancel_flag and inventory_change_since_start(job):
+        if host_trust.assess(job, read_map=False).action == host_trust.STOP_AND_FAIL:
             # Cancelling right after attaching can drop output the new unit has not copied from
             # the pod yet, so read the pod's log in full, then stop it. A canceled job goes the usual way.
             return harvest_terminal_pod(job, pod_name, pod, owner_task_id=owner_task_id, clock=clock, stop_pod=True)

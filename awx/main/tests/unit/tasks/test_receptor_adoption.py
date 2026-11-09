@@ -22,7 +22,7 @@ import pytest
 from django.test import override_settings
 from django.utils.timezone import now
 
-from awx.main.models import Job
+from awx.main.tasks import host_trust
 from awx.main.tasks.callback import RunnerCallback
 from awx.main.tasks.jobs import _finalize_job_run
 from awx.main.tasks.receptor import (
@@ -1510,59 +1510,8 @@ def test_finalize_job_run_logs_lifecycle(mock_update, mock_hook, mock_task_mgr, 
 
 
 # ---------------------------------------------------------------------------
-# populate_host_map — shared by the normal path and adoption
+# host_map — sourced by the normal path and adoption, not by configure_for_job
 # ---------------------------------------------------------------------------
-
-
-def _job_instance(**attrs):
-    instance = Mock(spec=Job)
-    instance.job_env = {}
-    instance.inventory_id = 42
-    for name, value in attrs.items():
-        setattr(instance, name, value)
-    return instance
-
-
-def test_populate_host_map_from_inventory_populates_host_map():
-    """The adoption path sources host_map by fetching script_data itself, once the inventory is known to be unchanged."""
-    cb = RunnerCallback(model=None)
-    instance = _job_instance()
-    instance.inventory.get_script_data.return_value = {
-        '_meta': {
-            'hostvars': {
-                'host1': {'remote_tower_id': 'ext-1'},
-                'host2': {'remote_tower_id': 'ext-2'},
-            }
-        }
-    }
-
-    with patch('awx.main.tasks.callback.inventory_change_since_start', return_value=None):
-        assert cb.populate_host_map_from_inventory(instance) is None
-
-    assert cb.host_map == {'host1': 'ext-1', 'host2': 'ext-2'}
-
-
-def test_populate_host_map_from_inventory_swallows_error():
-    """If fetching inventory hosts raises, the exception is swallowed and host_map stays {}."""
-    cb = RunnerCallback(model=None)
-    instance = _job_instance()
-    instance.inventory.get_script_data.side_effect = Exception('DB error')
-
-    with patch('awx.main.tasks.callback.inventory_change_since_start', return_value=None):
-        cb.populate_host_map_from_inventory(instance)  # must not raise
-
-    assert cb.host_map == {}
-
-
-def test_populate_host_map_from_inventory_fails_closed_without_a_saved_count():
-    """A job with no host count saved at start is not trusted: no query, empty map, and a reason."""
-    cb = RunnerCallback(model=None)
-    instance = _job_instance()
-
-    assert 'no host count' in cb.populate_host_map_from_inventory(instance)
-
-    assert cb.host_map == {}
-    instance.inventory.get_script_data.assert_not_called()
 
 
 def test_configure_for_job_does_not_touch_inventory():
@@ -1579,10 +1528,10 @@ def test_configure_for_job_does_not_touch_inventory():
     instance.inventory.get_script_data.assert_not_called()
 
 
-def test_inventory_script_params_matches_build_inventory():
+def test_script_params_match_build_inventory():
     """Adoption must ask for the same script_data shape build_inventory writes, slicing included."""
     sliced = Mock(job_slice_number=2, job_slice_count=5)
-    assert RunnerCallback.inventory_script_params(sliced) == {
+    assert host_trust.script_params(sliced) == {
         'hostvars': True,
         'towervars': True,
         'slice_number': 2,
@@ -1590,7 +1539,7 @@ def test_inventory_script_params_matches_build_inventory():
     }
 
     unsliced = Mock(spec=[])  # no job_slice_number attribute
-    assert RunnerCallback.inventory_script_params(unsliced) == {'hostvars': True, 'towervars': True}
+    assert host_trust.script_params(unsliced) == {'hostvars': True, 'towervars': True}
 
 
 # ---------------------------------------------------------------------------

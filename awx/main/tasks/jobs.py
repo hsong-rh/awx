@@ -68,6 +68,7 @@ from awx.main.tasks.callback import (
     RunnerCallbackForProjectUpdate,
     RunnerCallbackForSystemJob,
 )
+from awx.main.tasks import host_trust
 from awx.main.tasks.policy import evaluate_policy
 from awx.main.tasks.signals import with_signal_handling, signal_callback
 from awx.main.tasks.receptor import AWXReceptorJob
@@ -542,14 +543,13 @@ class BaseTask(object):
         script_data = inventory.get_script_data(**script_params)
         # Reuse the script_data we are about to write rather than making the callback fetch
         # its own copy, which is what the adoption path has to do.
-        self.runner_callback.populate_host_map(script_data)
+        self.runner_callback.host_map = host_trust.host_map_from(script_data)
         file_content = '#! /usr/bin/env python3\n# -*- coding: utf-8 -*-\nprint(%r)\n' % json.dumps(script_data)
         return self.write_private_data_file(private_data_dir, file_name, file_content, sub_dir='inventory', file_permissions=0o700)
 
     def build_inventory(self, instance, private_data_dir):
-        script_params = self.runner_callback.inventory_script_params(instance)
-        self.runner_callback.record_host_count(instance)
-        return self.write_inventory_file(instance.inventory, private_data_dir, 'hosts', script_params)
+        self.runner_callback.host_count = host_trust.count_hosts(instance)
+        return self.write_inventory_file(instance.inventory, private_data_dir, 'hosts', host_trust.script_params(instance))
 
     def build_args(self, instance, private_data_dir, passwords):
         raise NotImplementedError
