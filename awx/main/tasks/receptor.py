@@ -1358,11 +1358,8 @@ def _adoption_callback_class(job):
         return RunnerCallback
 
 
-def _build_adoption_callback(job, dedup_threshold, collision_zone, attached_pod=False):
-    """Construct the job type's RunnerCallback for event replay during adoption.
-
-    attached_pod: a new work unit is attached to the job's running pod; see host_trust.assess.
-    """
+def _build_adoption_callback(job, dedup_threshold, collision_zone):
+    """Construct the job type's RunnerCallback for event replay during adoption."""
     callback = _adoption_callback_class(job).create_for_job(
         job,
         safe_env=dict(job.job_env or {}),
@@ -1373,7 +1370,7 @@ def _build_adoption_callback(job, dedup_threshold, collision_zone, attached_pod=
     # file, so it has to source the same data itself or replayed events lose host_id. It does
     # so only for an inventory that is unchanged since the job started; otherwise the map is
     # empty and host_verdict says why.
-    callback.host_verdict = host_trust.assess(job, attached_pod=attached_pod)
+    callback.host_verdict = host_trust.assess(job)
     callback.host_map = callback.host_verdict.host_map
     if callback.host_verdict.reason:
         logger.warning('Job %s will not get host ids on replayed events: %s', job.id, callback.host_verdict.reason)
@@ -1819,21 +1816,12 @@ def reattach_to_work_unit(job, work, clock=None, owner_task_id=None, unit_status
         f'(max counter={max_counter}), replaying from startpos=0 with counter-skip'
     )
 
-    callback = _build_adoption_callback(job, safe_threshold, collision_zone, attached_pod=bool(pod_name))
+    # A changed inventory does not stop the unit: it runs to the end, and failed_by_inventory_change
+    # fails the job when it is finalized.
+    callback = _build_adoption_callback(job, safe_threshold, collision_zone)
     # Account for events already persisted so emitted_events / EOF final_counter reflect the
     # full job. Uses the DB count rather than len(collision_zone), which is capped.
     callback.event_ct = persisted_ct
-
-    # The job's host results can no longer be trusted, so stop the unit rather than let it run on:
-    # the stream below still carries what it already produced, as for a cancel. A pod attached
-    # to by a new unit is left to finish instead, because a cancel straight after the attach can
-    # drop output the unit has not copied from the pod yet. Either way the job ends failed.
-    if callback.host_verdict.action == host_trust.STOP_AND_FAIL:
-        logger.info(f'Job {job.id}: stopping work unit {unit_id}, its host results cannot be matched to the inventory')
-        try:
-            work.cancel(unit_id)
-        except Exception as exc:
-            logger.warning(f'Could not cancel work unit {unit_id} for job {job.id}: {exc}')
 
     private_data_dir = _get_or_create_private_data_dir(job)
     adoption_task = _AdoptionTask(job, callback)

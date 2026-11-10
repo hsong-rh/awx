@@ -34,15 +34,9 @@ def test_an_unchanged_inventory_proceeds_with_the_map(job, inv):
 
 
 @pytest.mark.django_db
-def test_a_changed_inventory_stops_and_fails_the_job(job, inv):
+def test_a_changed_inventory_fails_the_job_when_done(job, inv):
     inv.hosts.create(name='h3')
-    assert host_trust.assess(job) == host_trust.Verdict('hosts were added or removed', {}, host_trust.STOP_AND_FAIL)
-
-
-@pytest.mark.django_db
-def test_a_pod_attached_by_a_new_unit_is_failed_when_done(job, inv):
-    inv.hosts.create(name='h3')
-    assert host_trust.assess(job, attached_pod=True).action == host_trust.FAIL_WHEN_DONE
+    assert host_trust.assess(job) == host_trust.Verdict('hosts were added or removed', {}, host_trust.FAIL_WHEN_DONE)
 
 
 @pytest.mark.django_db
@@ -75,15 +69,15 @@ def test_a_change_while_the_map_is_read_empties_the_map(job):
         return data
 
     with mock.patch.object(Inventory, 'get_script_data', read_then_delete_a_host):
-        assert host_trust.assess(job) == host_trust.Verdict('hosts were added or removed', {}, host_trust.STOP_AND_FAIL)
+        assert host_trust.assess(job) == host_trust.Verdict('hosts were added or removed', {}, host_trust.FAIL_WHEN_DONE)
 
 
 @pytest.mark.django_db
-def test_a_map_that_cannot_be_read_stops_and_fails_the_job(job):
+def test_a_map_that_cannot_be_read_fails_the_job_when_done(job):
     with mock.patch.object(Inventory, 'get_script_data', side_effect=RuntimeError('db went away')):
-        assert host_trust.assess(job) == host_trust.Verdict('the host map could not be read', {}, host_trust.STOP_AND_FAIL)
+        assert host_trust.assess(job) == host_trust.Verdict('the host map could not be read', {}, host_trust.FAIL_WHEN_DONE)
 
 
 def test_the_verdict_is_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
-        host_trust.Verdict(None, {}, host_trust.PROCEED).action = host_trust.STOP_AND_FAIL
+        host_trust.Verdict(None, {}, host_trust.PROCEED).action = host_trust.FAIL_WHEN_DONE

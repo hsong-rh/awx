@@ -11,8 +11,7 @@ from typing import Optional
 logger = logging.getLogger('awx.main.tasks.host_trust')
 
 PROCEED = 'proceed'  # trusted, or canceled: the job ends the usual way
-STOP_AND_FAIL = 'stop_and_fail'  # stop the job's run now, then fail it
-FAIL_WHEN_DONE = 'fail_when_done'  # let a pod attached by a new unit finish, then fail the job
+FAIL_WHEN_DONE = 'fail_when_done'  # let the job's run finish, then fail the job
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,7 +85,7 @@ def change_since_start(job):
     return None
 
 
-def assess(job, attached_pod=False, read_map=True):
+def assess(job, read_map=True):
     """Check the job's inventory against its start and say what adoption does with the job.
 
     The map is read only when read_map is set and the inventory is unchanged, then the check
@@ -105,10 +104,7 @@ def assess(job, attached_pod=False, read_map=True):
             reason = 'the host map could not be read'
         else:
             reason = change_since_start(job)
-    if reason is None or job.cancel_flag:
-        action = PROCEED
-    elif attached_pod:
-        action = FAIL_WHEN_DONE
-    else:
-        action = STOP_AND_FAIL
+    # The run is never stopped for a change: the playbook finishes on its hosts, and only the
+    # job's recorded result is failed.
+    action = PROCEED if reason is None or job.cancel_flag else FAIL_WHEN_DONE
     return Verdict(reason, {} if reason else host_map, action)

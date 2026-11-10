@@ -139,8 +139,8 @@ def _change_the_inventory(inventory, hosts):
 
 
 @pytest.mark.django_db
-def test_a_job_whose_inventory_changed_is_stopped_and_failed(me_inst, inventory):
-    # 5.2 Host map, AAP-100937. The unit is stopped, its output is still replayed (with no host
+def test_a_job_whose_inventory_changed_runs_to_the_end_and_fails(me_inst, inventory):
+    # 5.2 Host map, AAP-100937. The unit is not stopped, its output is replayed (with no host
     # ids), and the job ends failed with the reason, so no host result lands on the wrong host.
     hosts, job = _orphaned_job_over_five_hosts(me_inst, inventory, None)
     _change_the_inventory(inventory, hosts)
@@ -152,14 +152,13 @@ def test_a_job_whose_inventory_changed_is_stopped_and_failed(me_inst, inventory)
     assert job.status == 'failed'
     assert 'could not be matched to the inventory' in job.job_explanation
     assert 'hosts were added or removed' in job.job_explanation
-    assert ('cancel', UNIT) in work.calls
+    assert ('cancel', UNIT) not in work.calls
     assert hooks.call_args.args[3] == 'failed'  # post-run hooks, and the fact cache with them, only run for 'successful'
     assert [event for event in RecordingDispatcher.dispatched if event.get('host_name')]
 
 
 @pytest.mark.django_db
 def test_a_pod_attached_by_a_new_unit_is_left_to_finish_and_the_job_failed(me_inst, inventory):
-    # A cancel straight after the attach can drop output the unit has not copied from the pod yet.
     hosts, job = _orphaned_job_over_five_hosts(me_inst, inventory, None)
     _change_the_inventory(inventory, hosts)
     work = FakeReceptorWork({UNIT: FakeWorkUnit(host_events(list(hosts)))})
