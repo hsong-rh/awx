@@ -1015,6 +1015,27 @@ def test_finalize_adopted_job_cancel_outranks_the_host_counts_correction(mock_fi
     assert mock_finalize.call_args[0][3] == 'canceled'
 
 
+@override_settings(CLUSTER_HOST_ID='surviving-controller')
+@patch('awx.main.tasks.jobs._finalize_job_run')
+def test_finalize_adopted_job_inventory_change_outranks_the_host_counts_correction(mock_finalize):
+    """A job whose inventory changed runs to the end, so its stats are clean; it must still fail."""
+    job = Mock()
+    job.status = 'running'
+    job.cancel_flag = False
+    job.host_status_counts = {'ok': 5}
+    job.started = None
+    job.execution_node = None
+    _stub_last_event(job)
+    callback = Mock(wrapup_event_created=None)
+    callback.host_verdict = host_trust.Verdict('hosts were added or removed', {}, host_trust.FAIL_WHEN_DONE)
+    callback.extra_update_fields = {'job_explanation': 'Job failed because its host results could not be matched'}
+
+    _finalize_adopted_job(job, callback, exit_code=1, process_phase_failed=False, final_status='failed')
+
+    assert mock_finalize.call_args[0][3] == 'failed'
+    assert 'job_explanation' in callback.extra_update_fields
+
+
 # ---------------------------------------------------------------------------
 # _adopted_finished_at — recovering the real end time of an adopted job
 # ---------------------------------------------------------------------------

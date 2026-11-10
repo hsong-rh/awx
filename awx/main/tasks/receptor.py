@@ -1506,7 +1506,10 @@ def _finalize_adopted_job(job, callback, exit_code, process_phase_failed, final_
     # raising (e.g., an exception just before finalization). The work unit may have been
     # released, making the retry stream empty/errored. Use the real playbook outcome
     # from host_status_counts rather than the unreliable retry stream result.
-    if final_status == 'failed' and job.host_status_counts is not None:
+    # Not for a job failed by its changed inventory either: it ran to the end, so its stats are clean.
+    verdict = getattr(callback, 'host_verdict', None)
+    failed_by_inventory = isinstance(verdict, host_trust.Verdict) and verdict.action == host_trust.FAIL_WHEN_DONE
+    if final_status == 'failed' and job.host_status_counts is not None and not failed_by_inventory:
         corrected = _status_from_host_counts(job.host_status_counts)
         if corrected != 'failed':
             logger.info(
