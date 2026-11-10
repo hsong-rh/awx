@@ -2087,7 +2087,9 @@ def test_process_phase_breaks_out_of_a_stream_that_never_delivers(mock_signal, m
 
     assert rj.stream_stalled is True, 'the watchdog must recognise a stream that will never deliver'
     assert res.status == 'error'
-    sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+    # The watchdog's shutdown unblocks the reader; the final teardown then closes the stream.
+    sock.shutdown.assert_any_call(socket.SHUT_RDWR)
+    sock.close.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -2194,7 +2196,9 @@ def test_process_phase_exception_shuts_down_resultsock(mock_signal, mock_connect
 
     rj._process_phase(ReceptorWork(ctl))
 
-    resultsock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+    # The detach path's shutdown unblocks the processor; the final teardown then closes the stream.
+    resultsock.shutdown.assert_any_call(socket.SHUT_RDWR)
+    resultsock.close.assert_called_once_with()
 
 
 @patch('awx.main.tasks.receptor.connections')

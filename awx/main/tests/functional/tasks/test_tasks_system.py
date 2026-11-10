@@ -2727,6 +2727,9 @@ class _DesyncingReceptor:
     def close(self):
         self.desynced = False
 
+    def connect(self):
+        self.desynced = False
+
 
 @pytest.mark.django_db
 class TestWorkunitReaperResilience:
@@ -2748,13 +2751,8 @@ class TestWorkunitReaperResilience:
             Job.objects.create(status='successful', work_unit_id=unit_id, controller_node='awx-1')
 
     @contextmanager
-    def _receptor_raising_on(self, failing_command, receptor_data_dir='/tmp/no-such-receptor-data-dir', receptor_node_id='test-node'):
-        """A receptor that answers `work list` with every unit and raises for one command.
-
-        ``get_receptor_data_dir`` and ``get_receptor_node_id`` are patched to a directory that
-        does not exist on disk, so the post-release fallback cleanup path is exercised only
-        by the test that explicitly creates the directory.
-        """
+    def _receptor_raising_on(self, failing_command):
+        """A receptor that answers `work list` with every unit and raises for one command."""
         calls = []
 
         def simple_command(command):
@@ -2768,10 +2766,8 @@ class TestWorkunitReaperResilience:
         ctl = MagicMock()
         ctl.simple_command.side_effect = simple_command
         with patch('awx.main.tasks.system.get_receptor_ctl', return_value=ctl):
-            with patch('awx.main.tasks.system.get_receptor_data_dir', return_value=receptor_data_dir):
-                with patch('awx.main.tasks.system.get_receptor_node_id', return_value=receptor_node_id):
-                    with patch('awx.main.tasks.system.administrative_workunit_reaper') as admin:
-                        yield calls, admin
+            with patch('awx.main.tasks.system.administrative_workunit_reaper') as admin:
+                yield calls, admin
 
     def test_a_unit_receptor_has_forgotten_does_not_strand_the_units_behind_it(self, settings):
         settings.RECEPTOR_RELEASE_WORK = True
@@ -2825,38 +2821,23 @@ class TestWorkunitReaperResilience:
         ctl = _DesyncingReceptor(self.UNITS, forgotten={'unit-forgotten'})
 
         with patch('awx.main.tasks.system.get_receptor_ctl', return_value=ctl):
-            with patch('awx.main.tasks.system.get_receptor_data_dir', return_value='/tmp/no-such-receptor-data-dir'):
-                with patch('awx.main.tasks.system.get_receptor_node_id', return_value='test-node'):
-                    with patch('awx.main.tasks.system.administrative_workunit_reaper'):
-                        awx_receptor_workunit_reaper()
+            with patch('awx.main.tasks.system.administrative_workunit_reaper'):
+                awx_receptor_workunit_reaper()
 
         assert ctl.released == ['unit-second', 'unit-third']
 
-    def test_a_stale_local_proxy_directory_is_deleted_when_release_fails(self, settings):
-        """After adoption on another controller, the original ctrl0's local proxy directory for
-        the work unit survives on disk: `work release` still fails because the remote EE has
-        already cleaned up, but the local files remain indefinitely.
-
-        When the release command fails AND the unit's directory exists under receptor's data dir
-        (`<datadir>/<node_id>/<unit_id>/`), the reaper should remove it directly so the disk
-        space is freed and the unit stops appearing in `work list` after the next receptor restart.
-        Measured on the cluster: 18 stale directories, all for finished jobs, logging warnings on
-        every 60-second reaper pass because receptor's in-memory state keeps showing them until
-        the process is restarted.
+    def test_a_stale_local_proxy_is_force_released_when_release_fails(self, settings):
+        """After adoption on another controller, the original controller's local proxy for the
+        work unit survives: `work release` fails because the remote EE has already cleaned up.
+        Receptor reports that as "error cancelling remote unit: unknown work unit", and the reaper
+        then drops the local proxy with `work force-release` (release_work_unit) so the disk is
+        freed. Measured on the cluster before the fix: 18 stale directories, all for finished jobs.
         """
         settings.RECEPTOR_RELEASE_WORK = True
         settings.RECEPTOR_KEEP_WORK_ON_ERROR = False
         self._finished_jobs()
 
-        with tempfile.TemporaryDirectory() as receptor_data_dir:
-            # Build the expected unit directory path that the reaper should clean up.
-            unit_dir = os.path.join(receptor_data_dir, 'awx-test-node', 'unit-forgotten')
-            os.makedirs(unit_dir)
-            (open(os.path.join(unit_dir, 'status'), 'w')).close()  # non-empty dir
+        with self._receptor_raising_on('work release unit-forgotten') as (calls, _admin):
+            awx_receptor_workunit_reaper()
 
-            with self._receptor_raising_on('work release unit-forgotten') as (calls, _admin):
-                with patch('awx.main.tasks.system.get_receptor_data_dir', return_value=receptor_data_dir):
-                    with patch('awx.main.tasks.system.get_receptor_node_id', return_value='awx-test-node'):
-                        awx_receptor_workunit_reaper()
-
-            assert not os.path.exists(unit_dir), 'stale proxy directory should have been removed'
+        assert 'work force-release unit-forgotten' in calls

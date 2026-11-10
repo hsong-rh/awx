@@ -387,6 +387,7 @@ def release_work_unit(receptor_ctl, unit_id, work_list):
             return True
         except Exception:
             logger.warning(f"Error force-releasing work unit {unit_id}", exc_info=True)
+            reset_receptor_connection(receptor_ctl)
 
     return False
 

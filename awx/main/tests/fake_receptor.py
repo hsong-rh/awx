@@ -116,6 +116,9 @@ class FakeSocket:
     def shutdown(self, how):
         self.closed = True
 
+    def close(self):
+        self.closed = True
+
 
 class FakeReceptorWork(ReceptorWork):
     def __init__(self, units=None):
