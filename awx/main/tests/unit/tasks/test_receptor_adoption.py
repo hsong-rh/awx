@@ -187,6 +187,66 @@ def test_run_internal_streams_through_receptor_work(mock_transmit, mock_process)
     mock_process.assert_called_once_with(rj.work)
 
 
+# AAP-97867: a pod kill takes receptor down at once, and this worker can see the dead socket
+# before its shutdown signal. The job is left running for adoption, not failed as error.
+
+
+@patch('awx.main.tasks.receptor.AWXReceptorJob._process_phase')
+@patch('awx.main.tasks.receptor.AWXReceptorJob._transmit_phase', side_effect=ConnectionResetError(104, 'Connection reset by peer'))
+def test_run_internal_detaches_when_receptor_dies_during_submit(mock_transmit, mock_process):
+    rj = _make_receptor_job(unit_id=None)
+
+    res = rj._run_internal(Mock())
+
+    assert rj.detached is True
+    assert res.status == 'error'
+    mock_process.assert_not_called()
+
+
+@patch('awx.main.tasks.receptor.AWXReceptorJob._transmit_phase', side_effect=ValueError('bad payload'))
+def test_run_internal_still_raises_an_error_that_is_not_receptor_dying(mock_transmit):
+    rj = _make_receptor_job(unit_id=None)
+
+    with pytest.raises(ValueError):
+        rj._run_internal(Mock())
+
+    assert getattr(rj, 'detached', False) is not True
+
+
+@patch('awx.main.tasks.receptor.AWXReceptorJob._transmit_phase', side_effect=ConnectionResetError(104, 'Connection reset by peer'))
+def test_run_internal_does_not_detach_a_canceled_job_when_receptor_dies(mock_transmit):
+    rj = _make_receptor_job(unit_id=None, cancel_flag=True)
+
+    with pytest.raises(ConnectionResetError):
+        rj._run_internal(Mock())
+
+    assert getattr(rj, 'detached', False) is not True
+
+
+@patch('awx.main.tasks.receptor.AWXReceptorJob._transmit_phase')
+def test_run_internal_detaches_when_receptor_refuses_the_results_stream(mock_transmit):
+    rj = _make_receptor_job()
+    ctl = Mock()
+    ctl.get_work_results.side_effect = ConnectionRefusedError(111, 'Connection refused')
+
+    res = rj._run_internal(ctl)
+
+    assert rj.detached is True
+    assert res.status == 'error'
+
+
+@patch('awx.main.tasks.receptor.AWXReceptorJob._transmit_phase')
+def test_run_internal_still_raises_when_the_results_stream_fails_otherwise(mock_transmit):
+    rj = _make_receptor_job()
+    ctl = Mock()
+    ctl.get_work_results.side_effect = RuntimeError('Remote error: unit not found')
+
+    with pytest.raises(RuntimeError):
+        rj._run_internal(ctl)
+
+    assert getattr(rj, 'detached', False) is not True
+
+
 # ---------------------------------------------------------------------------
 # receptor_config_exists
 # ---------------------------------------------------------------------------

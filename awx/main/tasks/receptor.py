@@ -455,6 +455,9 @@ class RemoteJobError(RuntimeError):
 
 _PhaseResult = namedtuple('_PhaseResult', ['status', 'rc'])
 
+# What the receptor control socket raises when receptor is gone: refused or reset, or its socket file deleted.
+RECEPTOR_GONE = (ConnectionError, FileNotFoundError)
+
 
 def run_until_complete(node, timing_data=None, worktype='ansible-runner', ttl='20s', **kwargs):
     """
@@ -645,9 +648,10 @@ class _CountingReader:
 
 class AWXReceptorJob:
     # Set by _process_phase when it walked away from a still-running work unit instead of
-    # canceling it; see _cancel_unit_on_signal. Callers must then leave the job 'running'
-    # with its work_unit_id, and must not finalize or release it — that state is what lets
-    # the unit be adopted again.
+    # canceling it; see _cancel_unit_on_signal. Also set when receptor died under the job,
+    # before or after the unit was created; see _detach_from_dead_receptor. Callers must then
+    # leave the job 'running' with its work_unit_id (if any), and must not finalize or release
+    # it — that state is what lets the job be adopted, or requeued when it has no unit.
     detached = False
 
     # Seconds the results stream may sit idle *while the work unit is already terminal*
@@ -713,8 +717,29 @@ class AWXReceptorJob:
 
     def _run_internal(self, receptor_ctl):
         self.work = ReceptorWork(receptor_ctl)
-        self._transmit_phase(receptor_ctl)
-        return self._process_phase(self.work)
+        # Only here, not in _process_phase: adoption shares that, and finalizes from the unit's status when the stream fails.
+        try:
+            self._transmit_phase(receptor_ctl)
+            return self._process_phase(self.work)
+        except RECEPTOR_GONE as exc:
+            return self._detach_from_dead_receptor(exc)
+
+    def _detach_from_dead_receptor(self, exc):
+        """Leave the job running when receptor died under it, unless the user canceled it (AAP-97867).
+
+        A pod kill stops receptor at once, and this worker can see the dead socket before its
+        shutdown signal. Failing the job then would hide a pod or remote unit that may already
+        run it. Left running, adoption attaches to that pod or unit, or requeues a job with no unit.
+        """
+        if self._cancel_unit_on_signal():
+            raise exc
+        self.detached = True
+        if self.unit_id is None:
+            # receptor replies only after it started the unit, so one may run with an id we never got.
+            logger.warning(f'{self.task.instance.log_format}: receptor died while the job was submitted ({exc!r}); leaving it running with no work unit')
+        else:
+            logger.warning(f'{self.task.instance.log_format}: receptor died under work unit {self.unit_id} ({exc!r}); detaching for adoption')
+        return _PhaseResult('error', 1)
 
     def _transmit_phase(self, receptor_ctl):
         """Submit work to receptor and wait for the transmit thread to finish.
