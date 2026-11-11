@@ -153,6 +153,30 @@ def test_orphan_silent_past_the_deadline_is_still_streamed_while_its_unit_answer
     assert job.status == 'successful'
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize('unit_status', ['successful', 'timeout'])
+def test_reachable_unit_with_unprocessed_events_is_drained_and_finalized_not_reaped(adoption_env, orphan, unit_status):
+    # TC-11. event_processing_finished is False and the adoption timeout has long passed, but the
+    # unit answers and still holds events AWX never saw. AWX must drain them and finalize from the
+    # unit's own result; HADR_JOB_ADOPTION_TIMEOUT applies only to a unit it cannot reach.
+    job, last_event = orphan
+    assert job.event_processing_finished is False
+    unit = FakeWorkUnit(make_events(10), status=unit_status, state='Failed' if unit_status == 'timeout' else None)
+    work = FakeReceptorWork({UNIT: unit})
+    clock = FakeClock(last_event + timedelta(seconds=TIMEOUT * 10))
+
+    adopt_job(job.id, open_work=lambda: work, clock=clock)
+
+    job.refresh_from_db()
+    assert RecordingDispatcher.counters() == list(range(2, 11))
+    assert 'HADR_JOB_ADOPTION_TIMEOUT' not in job.job_explanation
+    if unit_status == 'timeout':
+        assert job.status == 'failed'
+        assert 'timeout' in job.job_explanation
+    else:
+        assert job.status == 'successful'
+
+
 # ── Stall budgets on the injected clock ──────────────────────────────────────
 
 
