@@ -1074,7 +1074,9 @@ def _startup_reap_undispatched(hostname):
         reaper.reap_job(
             j,
             'failed',
-            job_explanation='Task was marked as running at system start up. The system must have not shut down properly, so it has been marked as failed.',
+            job_explanation=reap_explanation(
+                j, 'Task was marked as running at system start up. The system must have not shut down properly, so it has been marked as failed.'
+            ),
         )
     if job_ids:
         logger.error(f'Unified jobs {job_ids} were reaped on dispatch startup')
@@ -1101,7 +1103,9 @@ def _process_startup_jobs(this_inst):
                 reaper.reap_job(
                     j,
                     'failed',
-                    job_explanation='Task was marked as running at system start up. The system must have not shut down properly, so it has been marked as failed.',
+                    job_explanation=reap_explanation(
+                        j, 'Task was marked as running at system start up. The system must have not shut down properly, so it has been marked as failed.'
+                    ),
                 )
         except Exception:
             logger.exception(f'Failed processing job {j.id} in startup job loop')

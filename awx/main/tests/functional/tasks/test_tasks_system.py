@@ -1018,6 +1018,16 @@ def test_process_startup_jobs_reaps_undispatched_job(me_inst, settings):
 
 
 @pytest.mark.django_db
+def test_process_startup_jobs_warns_that_a_submitted_job_may_still_run(me_inst):
+    """A controller that died between submit and the work_unit_id save left a playbook that may still be running."""
+    job = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id=None, job_env={'receptor_submit_started': True})
+    _process_startup_jobs(me_inst)
+    job.refresh_from_db()
+    assert job.status == 'failed'
+    assert 'may still be running' in job.job_explanation
+
+
+@pytest.mark.django_db
 def test_reap_reaps_dispatched_jobs(me_inst):
     """reap() reaps dispatched jobs (no undispatched_only filter)."""
     dispatched = Job.objects.create(controller_node=me_inst.hostname, status='running', work_unit_id='unit-xyz')
