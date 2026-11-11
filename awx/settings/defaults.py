@@ -453,8 +453,8 @@ HADR_CONTAINER_GROUP_WEDGE_TIMEOUT = 300
 # sweep or by the next heartbeat, so a low cap costs latency, never correctness.
 HADR_ORPHAN_SWEEP_MAX_PER_HEARTBEAT = 50
 
-# Test facility: lets tests inject faults at named failpoints (awx.main.utils.failpoints).
-# Inert until a failpoint is armed, but never enable it in production.
+# Test facility: lets a fault-injection harness act at named failpoints (awx.main.utils.failpoints).
+# Inert unless the harness installs a handler, but never enable it in production.
 AWX_FAILPOINTS_ENABLED = False
 
 EXECUTION_NODE_REMEDIATION_CHECKS = 60 * 30  # once every 30 minutes check if an execution node errors have been resolved

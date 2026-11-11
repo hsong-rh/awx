@@ -1,134 +1,55 @@
-import json
 import pathlib
 import re
-import signal
 from unittest import mock
 
 import pytest
-import redis
 
 from awx.main.utils import failpoints
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
-    failpoints._enabled = None
-    failpoints._armed = {}
-    failpoints._armed_at = 0.0
+def restore_handler():
+    # A harness may have installed its handler at startup; put it back after each test.
+    installed = failpoints._handler
     yield
-    failpoints._enabled = None
-    failpoints._armed = {}
-    failpoints._armed_at = 0.0
+    failpoints.set_handler(installed)
 
 
-def _arm_in_memory(armed):
-    """Bypass the database: pretend this armed set was just loaded."""
-    return mock.patch.object(failpoints, '_load_armed', return_value=armed)
+@pytest.fixture
+def handler():
+    handler = mock.Mock(return_value=True)
+    failpoints.set_handler(handler)
+    return handler
 
 
-def test_disabled_is_inert_and_skips_registry_check(settings):
+def test_no_handler_is_inert_and_skips_registry_check(settings):
+    failpoints.set_handler(None)
+    settings.AWX_FAILPOINTS_ENABLED = True
+    assert failpoints.failpoint('not.a.registered.name') is None
+
+
+def test_handler_is_not_called_while_disabled(settings, handler):
     settings.AWX_FAILPOINTS_ENABLED = False
-    with mock.patch.object(failpoints, '_load_armed') as load:
-        failpoints.failpoint('not.a.registered.name')
-    load.assert_not_called()
+    assert failpoints.failpoint('heartbeat.start') is None
+    handler.assert_not_called()
 
 
-def test_enabled_rejects_unregistered_name(settings):
+def test_handler_gets_the_context_with_node_and_pid(settings, handler):
+    settings.AWX_FAILPOINTS_ENABLED = True
+    settings.CLUSTER_HOST_ID = 'awx-1'
+
+    assert failpoints.failpoint('job.before_finalize', job_id=7) is True
+
+    name, ctx = handler.call_args[0]
+    assert name == 'job.before_finalize'
+    assert ctx['job_id'] == 7 and ctx['node'] == 'awx-1' and 'pid' in ctx
+
+
+def test_enabled_rejects_unregistered_name(settings, handler):
     settings.AWX_FAILPOINTS_ENABLED = True
     with pytest.raises(KeyError, match='Unregistered failpoint'):
         failpoints.failpoint('not.a.registered.name')
-
-
-def test_not_armed_does_nothing(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({}), mock.patch.object(failpoints, '_record_hit') as record:
-        failpoints.failpoint('heartbeat.start')
-    record.assert_not_called()
-
-
-def test_match_filters_by_context(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    settings.CLUSTER_HOST_ID = 'awx-1'
-    with _arm_in_memory({'heartbeat.start': {'node': 'awx-2'}}), mock.patch.object(failpoints, '_record_hit') as record:
-        failpoints.failpoint('heartbeat.start')
-    record.assert_not_called()
-
-    with _arm_in_memory({'heartbeat.start': {'node': 'awx-1', 'periodic': 'True'}}), mock.patch.object(failpoints, '_record_hit', return_value=None) as record:
-        failpoints.failpoint('heartbeat.start', periodic=True)
-    record.assert_called_once()
-    ctx = record.call_args[0][1]
-    assert ctx['node'] == 'awx-1' and ctx['periodic'] is True and 'pid' in ctx
-
-
-def test_raise_action(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'job.before_finalize': {}}), mock.patch.object(failpoints, '_record_hit', return_value=('raise', {})):
-        with pytest.raises(failpoints.FailpointError):
-            failpoints.failpoint('job.before_finalize', job_id=1)
-
-
-def test_raise_action_with_exception_class(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with (
-        _arm_in_memory({'health_check.redis_ping': {}}),
-        mock.patch.object(failpoints, '_record_hit', return_value=('raise', {'exception': 'redis.exceptions.ConnectionError'})),
-    ):
-        with pytest.raises(redis.exceptions.ConnectionError):
-            failpoints.failpoint('health_check.redis_ping')
-
-
-def test_arm_rejects_non_exception_class():
-    with pytest.raises(TypeError):
-        failpoints.arm('heartbeat.start', 'raise', exception='os.path')
-    with pytest.raises(AttributeError):
-        failpoints.arm('heartbeat.start', 'raise', exception='redis.exceptions.NoSuchError')
-
-
-def test_sleep_action(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'job.before_finalize': {}}), mock.patch.object(failpoints, '_record_hit', return_value=('sleep', {'seconds': 2})):
-        with mock.patch.object(failpoints.time, 'sleep') as sleep:
-            failpoints.failpoint('job.before_finalize')
-    sleep.assert_called_once_with(2.0)
-
-
-def test_kill_action_signals_self(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'job.before_finalize': {}}), mock.patch.object(failpoints, '_record_hit', return_value=('kill', {})):
-        with mock.patch.object(failpoints.os, 'kill') as kill:
-            failpoints.failpoint('job.before_finalize')
-    kill.assert_called_once_with(failpoints.os.getpid(), signal.SIGKILL)
-
-
-def test_pause_action_delegates(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'heartbeat.start': {}}), mock.patch.object(failpoints, '_record_hit', return_value=('pause', {'timeout': 5})):
-        with mock.patch.object(failpoints, '_pause') as pause:
-            failpoints.failpoint('heartbeat.start')
-    pause.assert_called_once_with('heartbeat.start', {'timeout': 5})
-
-
-def test_hit_not_fired_continues(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'heartbeat.start': {}}), mock.patch.object(failpoints, '_record_hit', return_value=None):
-        with mock.patch.object(failpoints, '_pause') as pause:
-            failpoints.failpoint('heartbeat.start')
-    pause.assert_not_called()
-
-
-def test_record_failure_never_fires(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'heartbeat.start': {}}), mock.patch.object(failpoints, '_record_hit', side_effect=RuntimeError('db down')):
-        with mock.patch.object(failpoints, '_pause') as pause:
-            failpoints.failpoint('heartbeat.start')
-    pause.assert_not_called()
-
-
-def test_arm_validates_name_and_action():
-    with pytest.raises(KeyError):
-        failpoints.arm('nope', 'pause')
-    with pytest.raises(ValueError):
-        failpoints.arm('heartbeat.start', 'explode')
+    handler.assert_not_called()
 
 
 def test_every_call_site_is_registered():
@@ -141,132 +62,3 @@ def test_every_call_site_is_registered():
         used |= set(re.findall(r"\bfailpoint\('([a-z_.]+)'", path.read_text(errors='ignore')))
     assert used - set(failpoints.REGISTRY) == set()
     assert set(failpoints.REGISTRY) - used == set()
-
-
-def test_json_decodes_text_and_passes_dicts():
-    assert failpoints._json('{"node": "awx-1"}') == {'node': 'awx-1'}
-    assert failpoints._json({'a': 1}) == {'a': 1}
-    assert failpoints._json(None) == {}
-    assert failpoints._json('') == {}
-
-
-def test_bad_match_never_crashes_call_site(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'heartbeat.start': 'not-a-dict'}), mock.patch.object(failpoints, '_record_hit') as record:
-        failpoints.failpoint('heartbeat.start')
-    record.assert_not_called()
-
-
-def test_record_snapshot_is_inert_when_disabled(settings):
-    settings.AWX_FAILPOINTS_ENABLED = False
-    with mock.patch.object(failpoints, 'ensure_tables') as ensure:
-        failpoints.record_snapshot('host_map', 1, {'h1': 1})
-    ensure.assert_not_called()
-
-
-def test_record_snapshot_never_raises(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with mock.patch.object(failpoints, 'ensure_tables', side_effect=RuntimeError('db down')):
-        failpoints.record_snapshot('host_map', 1, {'h1': 1})
-
-
-class _FlakyCursor:
-    """Fails the first pause poll as if the database restarted, then reports a release."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def execute(self, sql, params):
-        self.calls += 1
-        if self.calls == 1:
-            raise failpoints.DatabaseError('server closed the connection unexpectedly')
-
-    def fetchone(self):
-        return (True, None, 0.0)
-
-
-def test_pause_survives_a_database_restart():
-    cursor = _FlakyCursor()
-    with (
-        mock.patch.object(failpoints.connection, 'cursor', return_value=cursor),
-        mock.patch.object(failpoints.connection, 'close') as close,
-        mock.patch.object(failpoints.time, 'sleep'),
-    ):
-        failpoints._pause('adoption.before_finalize', {'timeout': 60})
-    assert close.call_count == 1
-    assert cursor.calls == 2
-
-
-def test_trigger_returns_true_and_does_nothing_else(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({'heartbeat.force_lost': {}}), mock.patch.object(failpoints, '_record_hit', return_value=('trigger', {})):
-        assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is True
-
-
-def test_failpoint_returns_none_when_it_did_not_fire(settings):
-    settings.AWX_FAILPOINTS_ENABLED = True
-    with _arm_in_memory({}):
-        assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None
-    with _arm_in_memory({'heartbeat.force_lost': {}}), mock.patch.object(failpoints, '_record_hit', return_value=None):
-        assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None
-    settings.AWX_FAILPOINTS_ENABLED = False
-    assert failpoints.failpoint('heartbeat.force_lost', other='awx-1') is None
-
-
-class _RecordingCursor:
-    """Answers the pause poll with a scheduled release, and keeps what else is executed."""
-
-    def __init__(self, row, woke):
-        self.row = row
-        self.woke = woke
-        self.executed = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def execute(self, sql, params=None):
-        self.executed.append((sql, params))
-
-    def fetchone(self):
-        return self.row if len(self.executed) == 1 else (self.woke,)
-
-
-def test_scheduled_release_sleeps_to_the_shared_instant_and_records_how_late(settings):
-    settings.CLUSTER_HOST_ID = 'awx-2'
-    cursor = _RecordingCursor(row=(True, 1000.0, 998.0), woke=1000.05)
-    with mock.patch.object(failpoints.connection, 'cursor', return_value=cursor), mock.patch.object(failpoints.time, 'sleep') as sleep:
-        failpoints._pause('sweep.before_claim', {'timeout': 60})
-    sleep.assert_called_once_with(2.0)
-    sql, params = cursor.executed[-1]
-    assert 'INSERT INTO' in sql and params[0] == 'sweep.before_claim' and params[1] == 'awx-2' and params[4] == 'resumed'
-    assert json.loads(params[3])['late_ms'] == 50.0
-
-
-def test_plain_release_records_no_resume_and_does_not_wait(settings):
-    cursor = _RecordingCursor(row=(True, None, 998.0), woke=0)
-    with mock.patch.object(failpoints.connection, 'cursor', return_value=cursor), mock.patch.object(failpoints.time, 'sleep') as sleep:
-        failpoints._pause('sweep.before_claim', {'timeout': 60})
-    sleep.assert_not_called()
-    assert len(cursor.executed) == 1
-
-
-def test_release_in_releases_every_name_with_one_update():
-    cursor = mock.MagicMock()
-    cursor.__enter__.return_value = cursor
-    cursor.fetchall.return_value = [(1000.0,), (1000.0,)]
-    with mock.patch.object(failpoints, 'ensure_tables'), mock.patch.object(failpoints.connection, 'cursor', return_value=cursor):
-        out = failpoints.release_in(['sweep.before_claim', 'lost_instance.before_claim'], 2.0)
-    assert out == {'at': 1000.0, 'rows': 2}
-    assert cursor.execute.call_count == 1
-    sql, params = cursor.execute.call_args[0]
-    assert 'now()' in sql and 'clock_timestamp' not in sql
-    assert params == [2.0, ['sweep.before_claim', 'lost_instance.before_claim']]
