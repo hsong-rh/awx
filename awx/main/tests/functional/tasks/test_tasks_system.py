@@ -2032,6 +2032,54 @@ class TestOrphanSweep:
         queue.assert_not_called()
         assert Job.objects.get(pk=job.pk).controller_node == 'dead-controller'
 
+    def test_sweep_takes_the_task_manager_lock_without_waiting(self, me_inst):
+        """REQ-04: the TaskManager schedules from an in-memory capacity snapshot under this lock,
+        so a sweep claiming outside it can push a controller past its capacity."""
+        self._orphan()
+        taken = []
+
+        @contextmanager
+        def lock(name, wait=True, **kwargs):
+            taken.append((name, wait))
+            yield True
+
+        with patch('awx.main.tasks.system.advisory_lock', lock), patch('awx.main.tasks.system._publish_adoption'):
+            _sweep_orphaned_jobs(me_inst)
+
+        assert taken == [('task_manager_lock', False)]
+
+    def test_sweep_claims_nothing_while_the_task_manager_holds_the_lock(self, me_inst):
+        job = self._orphan()
+
+        with patch('awx.main.tasks.system.advisory_lock', _make_lock(False)), patch('awx.main.tasks.system._publish_adoption') as queue:
+            _sweep_orphaned_jobs(me_inst)
+
+        queue.assert_not_called()
+        assert Job.objects.get(pk=job.pk).controller_node == 'dead-controller'
+
+    def test_sweep_claims_while_holding_the_lock_and_releases_it_after(self, me_inst):
+        job = self._orphan()
+        held = {'now': False}
+        seen = []
+
+        @contextmanager
+        def lock(name, wait=True, **kwargs):
+            held['now'] = True
+            try:
+                yield True
+            finally:
+                held['now'] = False
+
+        def publish(job_id, task_id):
+            seen.append((held['now'], Job.objects.get(pk=job_id).controller_node))
+
+        with patch('awx.main.tasks.system.advisory_lock', lock), patch('awx.main.tasks.system._publish_adoption', side_effect=publish):
+            _sweep_orphaned_jobs(me_inst)
+
+        assert seen == [(True, me_inst.hostname)]
+        assert held['now'] is False
+        assert Job.objects.get(pk=job.pk).controller_node == me_inst.hostname
+
 
 @pytest.mark.django_db
 class TestLostInstanceCapacity:
