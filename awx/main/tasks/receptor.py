@@ -1783,6 +1783,7 @@ def _no_route_to(execution_node, work):
     try:
         status = work.receptor_ctl.simple_command('status')
     except Exception:
+        reset_receptor_connection(work.receptor_ctl)
         return False
     return not execution_node_reachable(execution_node, routed_hostnames(status))
 

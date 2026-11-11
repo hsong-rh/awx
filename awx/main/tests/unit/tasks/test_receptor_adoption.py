@@ -38,6 +38,7 @@ from awx.main.tasks.receptor import (
     _finalize_adoption_result,
     _get_adoption_exit_code,
     _get_or_create_private_data_dir,
+    _no_route_to,
     adopt_remote_work,
     clear_adoption_stall,
     receptor_config_exists,
@@ -204,6 +205,15 @@ def test_transmit_phase_marks_the_job_submitted_before_receptor_can_start_a_unit
 
     assert order[0] == ('update_model', {'job_env': {'host_count': 3, 'receptor_submit_started': True}})
     assert order[1] == ('submit_work', None)
+
+
+def test_no_route_to_drops_the_connection_when_status_fails():
+    # A failed command leaves its reply unread, so the next command on the connection would read it.
+    ctl = Mock()
+    ctl.simple_command.side_effect = RuntimeError('ERROR: boom')
+
+    assert _no_route_to('exec-1', ReceptorWork(ctl)) is False
+    ctl.close.assert_called_once_with()
 
 
 # AAP-97867: a pod kill takes receptor down at once, and this worker can see the dead socket
