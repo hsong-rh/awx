@@ -1208,10 +1208,15 @@ def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None, route_lookup=N
     node and stays `running` forever (observed: job 2068378, orphaned 2026-10-02).
 
     This sweep keys on job state rather than on the Instance row, which is what makes it a
-    reconciler instead of a second claimant. It needs no lock: the claim below is atomic, and
-    a successful claim sets controller_node to a *live* instance, which removes the job from
-    every other node's sweep. If that owner later dies it stops being live and the job becomes
-    sweepable again — the same rule recovers from a failed adopter.
+    reconciler instead of a second claimant. The claim below is atomic, and a successful claim
+    sets controller_node to a *live* instance, which removes the job from every other node's
+    sweep. If that owner later dies it stops being live and the job becomes sweepable again —
+    the same rule recovers from a failed adopter.
+
+    The claims are made under `task_manager_lock`, without waiting. The atomic claim stops two
+    nodes adopting one job, but not overfilling a node: the TaskManager schedules from a
+    capacity snapshot taken under that lock, so a claim landing mid-run is invisible to it
+    (REQ-04). If the lock is busy the sweep does nothing; the next heartbeat tries again.
 
     Capacity is what distributes the work. Each claim is already counted in consumed_capacity,
     so _adoption_slot_available() sees it on the next iteration: this node takes what it can
@@ -1253,21 +1258,26 @@ def _sweep_orphaned_jobs(this_inst, clock=None, mesh_lookup=None, route_lookup=N
     orphans = _exclude_unreachable_execution_nodes(orphans, route_lookup or _receptor_routed_hostnames, clock)
 
     swept = 0
-    for orphan in orphans:
-        try:
-            # The orphan is not in consumed_capacity until the claim lands, so ask for its impact up front.
-            if not _room_for_another_controllers_job(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT):
-                logger.info(f'Orphan sweep stopping at {swept} adoptions: out of control capacity, peer or next heartbeat takes the rest')
-                break
-            failpoint('sweep.before_claim', job_id=orphan.id, former=orphan.controller_node)
-            if _dispatch_adoption(orphan, new_controller=this_inst.hostname) is None:
-                # Another node swept it between the query and here, or it just finished.
-                continue
-            swept += 1
-            logger.warning(f'Orphan sweep adopting job {orphan.id}: controller {orphan.controller_node} is no longer a live instance')
-        except Exception:
-            # One unadoptable job must not strand every job behind it in the list.
-            logger.exception(f'Orphan sweep failed to adopt job {orphan.id}')
+    # Taken after the lookups above: they call receptor, and the TaskManager should not wait on that.
+    with advisory_lock('task_manager_lock', wait=False) as acquired:
+        if not acquired:
+            logger.info('task_manager_lock held, deferring the orphan sweep to the next heartbeat')
+            return
+        for orphan in orphans:
+            try:
+                # The orphan is not in consumed_capacity until the claim lands, so ask for its impact up front.
+                if not _room_for_another_controllers_job(headroom_needed=settings.AWX_CONTROL_NODE_TASK_IMPACT):
+                    logger.info(f'Orphan sweep stopping at {swept} adoptions: out of control capacity, peer or next heartbeat takes the rest')
+                    break
+                failpoint('sweep.before_claim', job_id=orphan.id, former=orphan.controller_node)
+                if _dispatch_adoption(orphan, new_controller=this_inst.hostname) is None:
+                    # Another node swept it between the query and here, or it just finished.
+                    continue
+                swept += 1
+                logger.warning(f'Orphan sweep adopting job {orphan.id}: controller {orphan.controller_node} is no longer a live instance')
+            except Exception:
+                # One unadoptable job must not strand every job behind it in the list.
+                logger.exception(f'Orphan sweep failed to adopt job {orphan.id}')
 
     if swept:
         logger.info(f'Orphan sweep queued {swept} adoption(s) for jobs whose controller is gone')
