@@ -187,6 +187,25 @@ def test_run_internal_streams_through_receptor_work(mock_transmit, mock_process)
     mock_process.assert_called_once_with(rj.work)
 
 
+@patch.object(AWXReceptorJob, 'transmit')
+@patch.object(AWXReceptorJob, 'sign_work', new=False)
+@patch.object(AWXReceptorJob, 'receptor_params', new={})
+@patch.object(AWXReceptorJob, 'work_type', new='local')
+def test_transmit_phase_marks_the_job_submitted_before_receptor_can_start_a_unit(mock_transmit):
+    # receptor starts the unit before it replies, so the marker must be saved before the call (AAP-99320).
+    rj = _make_receptor_job(unit_id=None)
+    rj.task.instance.job_env = {'host_count': 3}
+    order = []
+    rj.task.update_model.side_effect = lambda pk, **kw: order.append(('update_model', kw)) or rj.task.instance
+    ctl = Mock()
+    ctl.submit_work.side_effect = lambda payload, **kw: payload.close() or order.append(('submit_work', None)) or {'unitid': 'unit-9'}
+
+    rj._transmit_phase(ctl)
+
+    assert order[0] == ('update_model', {'job_env': {'host_count': 3, 'receptor_submit_started': True}})
+    assert order[1] == ('submit_work', None)
+
+
 # AAP-97867: a pod kill takes receptor down at once, and this worker can see the dead socket
 # before its shutdown signal. The job is left running for adoption, not failed as error.
 

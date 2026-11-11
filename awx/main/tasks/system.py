@@ -83,6 +83,7 @@ from awx.main.tasks.adoption_decisions import (
     gate_lost_instances,
     live_controller_hostnames,
     mesh_hostnames,
+    reap_explanation,
     routed_hostnames,
     room_for_another_controllers_job,
     lost_instance_disposition,
@@ -958,7 +959,7 @@ def _handle_lost_instance_job(j, other_inst):
             f'Reaping job {j.id} of lost instance {other_inst.hostname}: controller={j.controller_node!r} execution_node={j.execution_node!r} '
             f'work_unit_id={j.work_unit_id!r} started={j.started} cancel_flag={j.cancel_flag}'
         )
-        reaper.reap_job(j, 'failed', job_explanation='Job reaped due to instance shutdown')
+        reaper.reap_job(j, 'failed', job_explanation=reap_explanation(j, 'Job reaped due to instance shutdown'))
         return
 
     failpoint('lost_instance.before_claim', job_id=j.id, lost=other_inst.hostname)
@@ -1146,7 +1147,7 @@ def _process_running_jobs(this_inst, active_task_ids, ref_time):
                 if UnifiedJob.objects.filter(pk=j.id, status='running').update(status='pending', controller_node='', execution_node=''):
                     logger.warning(f'Job {j.id} had no work unit and no dispatcher task; reset to pending for re-dispatch')
             elif action == JobAction.REAP:
-                reaper.reap_job(j, 'failed')
+                reaper.reap_job(j, 'failed', job_explanation=reap_explanation(j))
         except Exception:
             logger.exception(f'Failed processing job {j.id} in heartbeat job loop')
 

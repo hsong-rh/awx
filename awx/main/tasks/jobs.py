@@ -69,6 +69,7 @@ from awx.main.tasks.callback import (
     RunnerCallbackForSystemJob,
 )
 from awx.main.tasks import host_trust
+from awx.main.tasks.adoption_decisions import is_requeueable
 from awx.main.tasks.policy import evaluate_policy
 from awx.main.tasks.signals import with_signal_handling, signal_callback
 from awx.main.tasks.receptor import AWXReceptorJob
@@ -926,8 +927,9 @@ class BaseTask(object):
                 # it like the pre-EE check does. System jobs are excluded: they run ansible-runner
                 # inside this pod, so they may already have done work. A user cancel arrives as the
                 # same signal, so re-read cancel_flag, which was set after this task loaded the job.
+                # The re-read also brings the submit marker: receptor may have started a unit whose id never came back.
                 self.instance = self.update_model(pk)
-                if not self.instance.cancel_flag:
+                if not self.instance.cancel_flag and is_requeueable(self.instance):
                     logger.info(f'{self.instance.log_format} lost receptor to a shutdown before reaching EE; resetting to pending', exc_info=True)
                     self.instance = self.update_model(pk, status='pending', controller_node='', execution_node='')
                     return

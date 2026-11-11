@@ -61,6 +61,7 @@ def _job(job_id=42):
     job.pk = job_id
     job.is_container_group_task = True
     job.log_format = f'job {job_id}'
+    job.job_env = {}
     return job
 
 

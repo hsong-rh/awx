@@ -258,6 +258,19 @@ def test_run_does_not_reset_to_pending_when_user_cancelled_during_shutdown(jt_li
 
 
 @pytest.mark.django_db
+def test_run_does_not_reset_to_pending_when_receptor_dies_during_submit(jt_linked, execution_environment, mocker):
+    """receptor starts the unit before it replies, so a submit that got no reply may have a playbook running."""
+
+    def submit_started(job):
+        type(job).objects.filter(pk=job.pk).update(job_env={'receptor_submit_started': True})
+
+    job, mock_finalize, _ = _run_with_receptor_dying(jt_linked, execution_environment, mocker, on_failure=submit_started)
+
+    assert job.status != 'pending'
+    mock_finalize.assert_called_once()
+
+
+@pytest.mark.django_db
 def test_run_errors_local_system_job_that_loses_redis_at_shutdown(mocker):
     """A system job runs ansible-runner inside the controller pod, so it may have done work by the
     time redis (a pod container) goes away; only receptor jobs that never reached an EE are safe to re-dispatch."""

@@ -13,6 +13,8 @@ from enum import Enum
 
 from django.utils.timezone import timedelta
 
+from awx.main.constants import RECEPTOR_SUBMIT_STARTED
+
 
 class JobAction(str, Enum):
     SKIP = 'skip'
@@ -152,9 +154,31 @@ def execution_node_reachable(execution_node, routed):
     return not execution_node or routed is None or execution_node in routed
 
 
+def submitted_to_receptor(job):
+    """Did a controller start to submit this job to receptor? receptor may then run its unit with no work_unit_id saved."""
+    return bool((getattr(job, 'job_env', None) or {}).get(RECEPTOR_SUBMIT_STARTED))
+
+
 def is_requeueable(job):
-    """The task manager never dispatches launch_type='sync' (inline project/inventory updates), so a requeued one stays pending forever."""
-    return getattr(job, 'launch_type', None) != 'sync'
+    """May this job go back to pending and run again?
+
+    Not with launch_type='sync' (inline project/inventory updates): the task manager never
+    dispatches one, so a requeued one stays pending forever. Not once it was submitted to
+    receptor: receptor starts the unit before it replies with the id, so a controller lost
+    before it saved work_unit_id leaves a playbook running, and a requeue would run it twice
+    (gist 4.5, AAP-99320).
+    """
+    return getattr(job, 'launch_type', None) != 'sync' and not submitted_to_receptor(job)
+
+
+def reap_explanation(job, default=None):
+    """The job_explanation for reaping job: a warning when its playbook may still run, else default."""
+    if job.work_unit_id or not submitted_to_receptor(job):
+        return default
+    return (
+        f'Controller was lost while it submitted the job; its playbook may still be running on '
+        f'{job.execution_node or "its execution node"} and its result is lost.'
+    )
 
 
 def lost_instance_job_action(job, lost_hostname, slot_available, route_available=lambda: True):
