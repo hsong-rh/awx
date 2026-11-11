@@ -660,6 +660,10 @@ def inspect_execution_and_hop_nodes(instance_list, mesh_status):
             if instance.node_type in (Instance.Types.CONTROL, Instance.Types.HYBRID):
                 continue
 
+            # Test seam: pretend this node's advertisement was not seen (a false lost-node report).
+            if failpoint('mesh.ignore_advertisement', advertised=hostname):
+                continue
+
             last_seen = parse_date(ad['Time'])
             if instance.last_seen and instance.last_seen >= last_seen:
                 continue
@@ -874,6 +878,9 @@ def _heartbeat_instance_management(clock=None):
     inspect_execution_and_hop_nodes(instance_list, mesh_status)
 
     lost_instances, instance_list = find_lost_instances(instance_list, settings.CLUSTER_HOST_ID, nowtime)
+    # Test seam: a fired trigger judges that peer lost whatever its last_seen, and the gates below leave it.
+    forced = [inst for inst in instance_list if inst.hostname != settings.CLUSTER_HOST_ID and failpoint('heartbeat.force_lost', other=inst.hostname)]
+    instance_list = [inst for inst in instance_list if inst not in forced]
 
     if this_inst:
         if not _check_in_this_instance(this_inst, nowtime):
@@ -892,7 +899,7 @@ def _heartbeat_instance_management(clock=None):
         on_mesh = mesh_hostnames(mesh_status)
         lost_instances = drop_mesh_connected_control_nodes(lost_instances, on_mesh, nowtime, settings.HADR_JOB_ADOPTION_TIMEOUT)
 
-    return this_inst, instance_list, lost_instances, ctl
+    return this_inst, instance_list, lost_instances + forced, ctl
 
 
 def _heartbeat_check_versions(this_inst, instance_list):

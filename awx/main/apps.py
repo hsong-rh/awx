@@ -1,6 +1,7 @@
 from dispatcherd.config import setup as dispatcher_setup
 
 from django.apps import AppConfig
+from django.conf import settings
 from django.db import connection
 from django.utils.translation import gettext_lazy as _
 from django.core.management.base import CommandError
@@ -68,3 +69,9 @@ class MainConfig(AppConfig):
         self.configure_dispatcherd()
         self.load_named_url_feature()
         pre_migrate.connect(self.check_db_requirement, sender=self)
+
+        if settings.AWX_FAILPOINTS_ENABLED:
+            # Installed before any worker forks, so every dispatcher and callback receiver process has it.
+            from awx.main.utils import failpoint_harness, failpoints
+
+            failpoints.set_handler(failpoint_harness.handle)

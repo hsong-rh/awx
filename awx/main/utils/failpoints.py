@@ -16,6 +16,7 @@ from django.conf import settings
 # a handler is installed, so a typo in a test or in the code fails loudly instead of
 # silently never firing.
 REGISTRY = {
+    'mesh.ignore_advertisement': 'inspect_execution_and_hop_nodes: a mesh advertisement from an execution or hop node (ctx: advertised). A fired hit skips it, so the node looks unseen.',
     'heartbeat.start': 'Start of cluster_node_heartbeat, before instance management. Pausing it makes this node miss heartbeats while staying alive.',
     'job.after_submit_before_unit_saved': 'Normal job path: work unit submitted to receptor, work_unit_id not yet saved on the job.',
     'job.stream_started': 'Normal job and adoption path: results stream opened, before the first event is read.',
@@ -36,6 +37,7 @@ REGISTRY = {
     'sweep.before_claim': 'Orphan sweep: capacity available, before the claim UPDATE.',
     'adoption.before_adoption_published': '_publish_adoption: the adoption task id is on the job, the task not yet published (a cancel here reaches no worker).',
     'adoption.after_claim': 'adopt_job_async: job claimed for this controller, before the capacity check and streaming.',
+    'heartbeat.force_lost': 'Per peer in _heartbeat_instance_management (ctx: other). A fired trigger makes this heartbeat judge that peer lost, whatever its last_seen and its place on the mesh.',
     'adoption.before_task_id_saved': 'claim_for_adoption: the new celery_task_id is chosen, before the claim UPDATE writes it (a cancel here is addressed to the old owner).',
 }
 
